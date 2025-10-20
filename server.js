@@ -129,25 +129,49 @@ db.serialize(() => {
 });
 
 // ---- Middleware ----
-const ALLOWED_ORIGINS = [
+const ALLOWED_ORIGINS = new Set([
   'https://dolphinwalletfinder.xyz',
   'https://www.dolphinwalletfinder.xyz',
+]);
+
+const BASE_ALLOWED_HEADERS = [
+  'Content-Type',
+  'Authorization',
+  'X-Requested-With',
+  'Accept',
 ];
+const BASE_ALLOWED_METHODS = ['GET','POST','PUT','PATCH','DELETE','OPTIONS'];
+
+app.use('/api', (req, res, next) => {
+  const origin = req.headers.origin;
+  if (!origin || ALLOWED_ORIGINS.has(origin)) {
+    res.header('Access-Control-Allow-Origin', origin || '*'); 
+    res.header('Vary', 'Origin'); 
+    res.header('Access-Control-Allow-Methods', BASE_ALLOWED_METHODS.join(','));
+    const reqHdr = (req.headers['access-control-request-headers'] || '')
+      .split(',').map(s => s.trim()).filter(Boolean);
+    const hdrs = Array.from(new Set([...BASE_ALLOWED_HEADERS, ...reqHdr]));
+    res.header('Access-Control-Allow-Headers', hdrs.join(','));
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Max-Age', '86400');
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
 const corsOptions = {
   origin(origin, cb) {
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    if (!origin || ALLOWED_ORIGINS.has(origin)) return cb(null, true);
     return cb(new Error('Not allowed by CORS'));
   },
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true,  
-  maxAge: 86400,      
+  methods: BASE_ALLOWED_METHODS,
+  allowedHeaders: BASE_ALLOWED_HEADERS,
+  credentials: true,
+  maxAge: 86400,
+  optionsSuccessStatus: 204,
 };
-
 app.use(cors(corsOptions));
-// پاسخ به preflight برای همه‌ی مسیرها
-app.options('*', cors(corsOptions));
+app.options('*', cors(corsOptions)); 
 
 app.use(express.json());
 app.use(express.static(staticDir));
