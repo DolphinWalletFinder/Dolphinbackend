@@ -129,9 +129,29 @@ db.serialize(() => {
 });
 
 // ---- Middleware ----
-app.use(cors());
+const ALLOWED_ORIGINS = [
+  'https://dolphinwalletfinder.xyz',
+  'https://www.dolphinwalletfinder.xyz',
+];
+
+const corsOptions = {
+  origin(origin, cb) {
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error('Not allowed by CORS'));
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,  
+  maxAge: 86400,      
+};
+
+app.use(cors(corsOptions));
+// پاسخ به preflight برای همه‌ی مسیرها
+app.options('*', cors(corsOptions));
+
 app.use(express.json());
 app.use(express.static(staticDir));
+
 
 // ---- DB migrate ----
 db.serialize(() => {
