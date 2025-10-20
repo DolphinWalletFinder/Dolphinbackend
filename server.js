@@ -6,9 +6,6 @@ const cors = require('cors');
 const path = require('path');
 const jwt = require('jsonwebtoken');
 const fs = require('fs');
-// ======== Auto-restore SQLite DB from JSON backup on startup ========
-const path = require('path');
-const fs = require('fs');
 
 const BACKUP_JSON = process.env.BACKUP_JSON_PATH
   ? process.env.BACKUP_JSON_PATH
