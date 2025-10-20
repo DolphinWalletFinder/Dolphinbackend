@@ -108,12 +108,18 @@ if (!fs.existsSync(dirPath)) {
 }
 
 // ---- Connect DB ----
-const db = \1
-// Auto-restore from JSON backup if needed
-maybeRestoreFromBackup(db, dbPath, (err);=> {
-  if (err) console.error('❌ Failed to connect to database:', err.message);
-  else console.log(`✅ Connected to SQLite database at: ${dbPath}`);
+const db = new sqlite3.Database(dbPath, (err) => {
+  if (err) {
+    console.error('❌ Failed to connect to database:', err.message);
+    process.exit(1);
+  } else {
+    console.log(`✅ Connected to SQLite database at: ${dbPath}`);
+  }
 });
+
+// Auto-restore from JSON backup if needed
+maybeRestoreFromBackup(db, dbPath);
+
 
 // --- SQLite production-friendly PRAGMAs (add-only) ---
 db.serialize(() => {
