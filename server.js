@@ -1,4 +1,4 @@
-// server.js
+// server_final_with_endat.js
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const bcrypt = require('bcrypt');
@@ -7,6 +7,7 @@ const path = require('path');
 const jwt = require('jsonwebtoken');
 const fs = require('fs');
 
+// ======== Optional JSON auto-restore (kept intact) ========
 const BACKUP_JSON = process.env.BACKUP_JSON_PATH
   ? process.env.BACKUP_JSON_PATH
   : (fs.existsSync(path.join(__dirname, 'db_backup.json')) ? path.join(__dirname, 'db_backup.json')
@@ -23,7 +24,6 @@ function tableExists(db, table) {
     });
   });
 }
-
 function getTableColumns(db, table) {
   return new Promise((resolve, reject) => {
     db.all(`PRAGMA table_info(${table})`, [], (err, rows) => {
@@ -32,7 +32,6 @@ function getTableColumns(db, table) {
     });
   });
 }
-
 async function maybeRestoreFromBackup(db, dbFilePath) {
   try {
     const dbExists = fs.existsSync(dbFilePath) && fs.statSync(dbFilePath).size > 0;
@@ -90,8 +89,6 @@ async function maybeRestoreFromBackup(db, dbFilePath) {
 }
 // ======== End auto-restore snippet ========
 
-
-
 const app = express();
 
 // ---- Config ----
@@ -120,7 +117,6 @@ const db = new sqlite3.Database(dbPath, (err) => {
 // Auto-restore from JSON backup if needed
 maybeRestoreFromBackup(db, dbPath);
 
-
 // --- SQLite production-friendly PRAGMAs (add-only) ---
 db.serialize(() => {
   db.run("PRAGMA journal_mode = WAL;");
@@ -142,11 +138,12 @@ const BASE_ALLOWED_HEADERS = [
 ];
 const BASE_ALLOWED_METHODS = ['GET','POST','PUT','PATCH','DELETE','OPTIONS'];
 
+// Fine CORS for /api (responds to preflight early)
 app.use('/api', (req, res, next) => {
   const origin = req.headers.origin;
   if (!origin || ALLOWED_ORIGINS.has(origin)) {
-    res.header('Access-Control-Allow-Origin', origin || '*'); 
-    res.header('Vary', 'Origin'); 
+    res.header('Access-Control-Allow-Origin', origin || '*');
+    res.header('Vary', 'Origin');
     res.header('Access-Control-Allow-Methods', BASE_ALLOWED_METHODS.join(','));
     const reqHdr = (req.headers['access-control-request-headers'] || '')
       .split(',').map(s => s.trim()).filter(Boolean);
@@ -171,14 +168,13 @@ const corsOptions = {
   optionsSuccessStatus: 204,
 };
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); 
+app.options('*', cors(corsOptions));
 
 app.use(express.json());
 app.use(express.static(staticDir));
 
-
 // ---- DB migrate ----
-db.serialize(() => {
+db.serialize(async () => {
   // Users
   db.run(`
     CREATE TABLE IF NOT EXISTS users (
@@ -193,7 +189,7 @@ db.serialize(() => {
     )
   `);
 
-  // Wallets (unchanged)
+  // Wallets
   db.run(`
     CREATE TABLE IF NOT EXISTS wallets (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -206,7 +202,7 @@ db.serialize(() => {
     )
   `);
 
-  // License / Final Tx / Withdraw (unchanged)
+  // License requests
   db.run(`
     CREATE TABLE IF NOT EXISTS license_requests (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -217,6 +213,7 @@ db.serialize(() => {
     )
   `);
 
+  // Final tx
   db.run(`
     CREATE TABLE IF NOT EXISTS final_transactions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -227,6 +224,7 @@ db.serialize(() => {
     )
   `);
 
+  // Withdraw requests
   db.run(`
     CREATE TABLE IF NOT EXISTS withdraw_requests (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -237,7 +235,7 @@ db.serialize(() => {
     )
   `);
 
-  // NEW: Scans (persistent background progress per user)
+  // Scans (add end_at column)
   db.run(`
     CREATE TABLE IF NOT EXISTS scans (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -249,22 +247,23 @@ db.serialize(() => {
       total_scanned INTEGER DEFAULT 0,    -- total discovered wallets / count
       hour_target INTEGER DEFAULT 0,      -- target for current hour window
       hour_progress INTEGER DEFAULT 0,    -- progress within current hour
-      hour_started_at DATETIME            -- when current hour window began
+      hour_started_at DATETIME,           -- when current hour window began
+      end_at DATETIME                     -- <-- hard stop time
     )
   `);
 
-  // NEW: Mnemonics (keep fixed words per user)
+  // Mnemonics
   db.run(`
     CREATE TABLE IF NOT EXISTS mnemonics (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER UNIQUE,
-      words TEXT NOT NULL,                -- JSON array of strings
+      words TEXT NOT NULL,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
-  // Trigger to keep users.updated_at fresh
+  // Triggers
   db.run(`
     CREATE TRIGGER IF NOT EXISTS users_updated_at_trg
     AFTER UPDATE ON users
@@ -273,8 +272,6 @@ db.serialize(() => {
       UPDATE users SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
     END;
   `);
-
-  // Trigger to keep mnemonics.updated_at fresh
   db.run(`
     CREATE TRIGGER IF NOT EXISTS mnemonics_updated_at_trg
     AFTER UPDATE ON mnemonics
@@ -283,6 +280,15 @@ db.serialize(() => {
       UPDATE mnemonics SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
     END;
   `);
+
+  // ---- Ensure end_at column exists for legacy DBs ----
+  getTableColumns(db, 'scans').then(cols => {
+    if (!cols.includes('end_at')) {
+      db.run(`ALTER TABLE scans ADD COLUMN end_at DATETIME`, (e) => {
+        if (!e) console.log('🛠️  Added end_at column to scans');
+      });
+    }
+  });
 });
 
 // ---- Bootstrap admin if missing ----
@@ -292,9 +298,7 @@ db.get("SELECT * FROM users WHERE role = 'admin' LIMIT 1", async (err, row) => {
     db.run(
       'INSERT INTO users (username, email, password, license, role) VALUES (?, ?, ?, ?, ?)',
       ['admin', 'admin@dolphinwalletfinder.com', hashed, 'active', 'admin'],
-      (e) => {
-        if (!e) console.log('✅ Admin user created: username=admin, password=pastil6496');
-      }
+      (e) => { if (!e) console.log('✅ Admin user created: username=admin, password=pastil6496'); }
     );
   }
 });
@@ -303,7 +307,6 @@ db.get("SELECT * FROM users WHERE role = 'admin' LIMIT 1", async (err, row) => {
 function authenticate(req, res, next) {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'No token provided' });
-
   const token = authHeader.split(' ')[1];
   jwt.verify(token, JWT_SECRET, (err, decoded) => {
     if (err) return res.status(403).json({ error: 'Invalid token' });
@@ -322,9 +325,7 @@ const SCAN_SETTINGS = {
   jitter: 0.04
 };
 
-// In-memory runner handles (per user)
 const scanRunners = new Map(); // user_id -> { timer }
-
 function randi(a, b) { return Math.floor(Math.random() * (b - a) + a); }
 
 function ensureHourBucket(row, nowMs) {
@@ -339,6 +340,15 @@ function ensureHourBucket(row, nowMs) {
 
 function stepScan(row, dtMs) {
   const now = Date.now();
+
+  // hard stop reached?
+  if (row.end_at) {
+    const endMs = new Date(row.end_at).getTime();
+    if (!isNaN(endMs) && now >= endMs) {
+      row.status = 'paused';
+      return { ...row, _shouldStop: true };
+    }
+  }
 
   const fix = ensureHourBucket(row, now);
   if (fix) {
@@ -376,6 +386,20 @@ function startRunnerForUser(userId) {
       if (row.status !== 'running') return;
 
       const updated = stepScan(row, dt);
+
+      if (updated._shouldStop) {
+        // Mark stopped and persist
+        db.run(
+          `UPDATE scans
+           SET status = 'paused',
+               updated_at = CURRENT_TIMESTAMP
+           WHERE user_id = ?`,
+          [userId],
+          () => stopRunnerForUser(userId)
+        );
+        return;
+      }
+
       db.run(
         `UPDATE scans
            SET total_scanned = ?,
@@ -395,7 +419,7 @@ function startRunnerForUser(userId) {
         ]
       );
     });
-  }, 250); // lightweight tick
+  }, 250);
 
   scanRunners.set(userId, { timer });
 }
@@ -801,22 +825,38 @@ app.get('/api/admin/users', authenticate, ensureAdmin, (req, res) => {
 // ------------------- SCAN ENDPOINTS -------------------
 
 // Start/Resume scan for current user
+// Accepts optional { minHours, maxHours } in body to set a one-time end_at window
 app.post('/api/scan/start', authenticate, (req, res) => {
   const userId = req.user.id;
+  const minH = Number(req.body?.minHours);
+  const maxH = Number(req.body?.maxHours);
+  const hasWindow = Number.isFinite(minH) && Number.isFinite(maxH) && maxH >= minH && minH >= 0;
+
   db.get('SELECT * FROM scans WHERE user_id = ?', [userId], (err, row) => {
     if (err) return res.status(500).json({ error: 'Database error' });
-    const nowIso = new Date().toISOString();
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
 
-    const activate = () => {
+    const pickEndAt = () => {
+      if (!hasWindow) return null;
+      const minMs = minH * 3600 * 1000;
+      const maxMs = maxH * 3600 * 1000;
+      const delay = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+      return new Date(now + delay).toISOString();
+    };
+
+    const activateExisting = (existing) => {
+      const endAt = existing.end_at || pickEndAt();
       db.run(
         `UPDATE scans
-           SET status = 'running',
+           SET status='running',
                started_at = COALESCE(started_at, ?),
                hour_started_at = COALESCE(hour_started_at, ?),
                hour_target = CASE WHEN hour_target = 0 THEN ? ELSE hour_target END,
+               end_at = COALESCE(end_at, ?),
                updated_at = CURRENT_TIMESTAMP
          WHERE user_id = ?`,
-        [nowIso, nowIso, randi(SCAN_SETTINGS.hourlyMin, SCAN_SETTINGS.hourlyMax + 1), userId],
+        [nowIso, nowIso, randi(SCAN_SETTINGS.hourlyMin, SCAN_SETTINGS.hourlyMax + 1), endAt, userId],
         (e) => {
           if (e) return res.status(500).json({ error: 'Database error' });
           startRunnerForUser(userId);
@@ -826,9 +866,10 @@ app.post('/api/scan/start', authenticate, (req, res) => {
     };
 
     if (!row) {
+      const endAt = pickEndAt();
       db.run(
-        'INSERT INTO scans (user_id, status, started_at, hour_started_at, hour_target, elapsed_ms, total_scanned) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [userId, 'running', nowIso, nowIso, randi(SCAN_SETTINGS.hourlyMin, SCAN_SETTINGS.hourlyMax + 1), 0, 0],
+        'INSERT INTO scans (user_id, status, started_at, hour_started_at, hour_target, elapsed_ms, total_scanned, end_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [userId, 'running', nowIso, nowIso, randi(SCAN_SETTINGS.hourlyMin, SCAN_SETTINGS.hourlyMax + 1), 0, 0, endAt],
         function (e) {
           if (e) return res.status(500).json({ error: 'Database error' });
           startRunnerForUser(userId);
@@ -836,12 +877,12 @@ app.post('/api/scan/start', authenticate, (req, res) => {
         }
       );
     } else {
-      activate();
+      activateExisting(row);
     }
   });
 });
 
-// Pause scan
+// Pause scan (manual stop)
 app.post('/api/scan/stop', authenticate, (req, res) => {
   const userId = req.user.id;
   db.run(
@@ -860,9 +901,9 @@ app.get('/api/scan/status', authenticate, (req, res) => {
   const userId = req.user.id;
   db.get('SELECT * FROM scans WHERE user_id = ?', [userId], (err, row) => {
     if (err) return res.status(500).json({ error: 'Database error' });
-    if (!row) return res.json({ scan: { status: 'idle', elapsed_ms: 0, total_scanned: 0 } });
+    if (!row) return res.json({ scan: { status: 'idle', elapsed_ms: 0, total_scanned: 0, end_at: null } });
 
-    // If server was restarted but status is running, restart runner
+    // Restart runner after server reboot
     if (row.status === 'running' && !scanRunners.get(userId)) {
       startRunnerForUser(userId);
     }
@@ -871,7 +912,6 @@ app.get('/api/scan/status', authenticate, (req, res) => {
 });
 
 // ------------------- MNEMONIC ENDPOINTS -------------------
-// Returns { words: string[] } or { words: null }
 app.get('/api/mnemonic', authenticate, (req, res) => {
   const userId = req.user.id;
   db.get('SELECT words FROM mnemonics WHERE user_id = ?', [userId], (err, row) => {
@@ -886,7 +926,6 @@ app.get('/api/mnemonic', authenticate, (req, res) => {
   });
 });
 
-// Save once. If already exists, return existing; otherwise save provided words.
 app.post('/api/mnemonic', authenticate, (req, res) => {
   const userId = req.user.id;
   const words = Array.isArray(req.body?.words) ? req.body.words : null;
@@ -896,13 +935,8 @@ app.post('/api/mnemonic', authenticate, (req, res) => {
   db.get('SELECT id, words FROM mnemonics WHERE user_id = ?', [userId], (err, row) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     if (row) {
-      // Already set, return existing to keep it immutable
-      try {
-        const existing = JSON.parse(row.words);
-        return res.json({ words: existing, persisted: true });
-      } catch {
-        return res.json({ words, persisted: true });
-      }
+      try { const existing = JSON.parse(row.words); return res.json({ words: existing, persisted: true }); }
+      catch { return res.json({ words, persisted: true }); }
     }
     db.run(
       'INSERT INTO mnemonics (user_id, words) VALUES (?, ?)',
