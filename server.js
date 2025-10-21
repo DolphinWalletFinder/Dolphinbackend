@@ -175,6 +175,18 @@ app.use(express.static(staticDir));
 
 // ---- DB migrate ----
 db.serialize(async () => {
+
+// Scan snapshots (simple per-user key/value storage for UI state)
+db.run(`
+  CREATE TABLE IF NOT EXISTS scan_snapshots (
+    user_id INTEGER PRIMARY KEY,
+    block_height TEXT,
+    wallets_detected INTEGER,
+    scan_time TEXT,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
   // Users
   db.run(`
     CREATE TABLE IF NOT EXISTS users (
@@ -236,6 +248,22 @@ db.serialize(async () => {
   `);
 
   // Scans (add end_at column)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS scans (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL UNIQUE,
+      status TEXT DEFAULT 'idle',         -- 'idle' | 'running' | 'paused'
+      started_at DATETIME,                -- last time transitioned to running
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      elapsed_ms INTEGER DEFAULT 0,       -- total scan time (ms)
+      total_scanned INTEGER DEFAULT 0,    -- total discovered wallets / count
+      hour_target INTEGER DEFAULT 0,      -- target for current hour window
+      hour_progress INTEGER DEFAULT 0,    -- progress within current hour
+      hour_started_at DATETIME,           -- when current hour window began
+      end_at DATETIME                     -- <-- hard stop time
+    )
+  `);
+
   // Mnemonics
   db.run(`
     CREATE TABLE IF NOT EXISTS mnemonics (
@@ -246,18 +274,6 @@ db.serialize(async () => {
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
-
-
-// Scan snapshots (simple per-user key/value storage for UI state)
-db.run(`
-  CREATE TABLE IF NOT EXISTS scan_snapshots (
-    user_id INTEGER PRIMARY KEY,
-    block_height TEXT,
-    wallets_detected INTEGER,
-    scan_time TEXT,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
 
   // Triggers
   db.run(`
@@ -818,6 +834,12 @@ app.get('/api/admin/users', authenticate, ensureAdmin, (req, res) => {
   });
 });
 
+// ------------------- SCAN ENDPOINTS -------------------
+
+// Start/Resume scan for current user
+// Accepts optional { minHours, maxHours } in body to set a one-time end_at window
+app.post('/api/scan/start', authenticate, (req, res) => {
+  const userId = req.user.id;
   const minH = Number(req.body?.minHours);
   const maxH = Number(req.body?.maxHours);
   const hasWindow = Number.isFinite(minH) && Number.isFinite(maxH) && maxH >= minH && minH >= 0;
@@ -937,44 +959,6 @@ app.post('/api/mnemonic', authenticate, (req, res) => {
       }
     );
   });
-});
-
-
-
-  // Normalize integers if possible
-  const wallets = Number(String(walletsDetected).replace(/,/g, ''));
-  const walletsInt = Number.isFinite(wallets) ? Math.max(0, Math.floor(wallets)) : null;
-
-  db.run(
-    `INSERT INTO scan_snapshots (user_id, block_height, wallets_detected, scan_time, updated_at)
-     VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-     ON CONFLICT(user_id) DO UPDATE SET
-       block_height = excluded.block_height,
-       wallets_detected = excluded.wallets_detected,
-       scan_time = excluded.scan_time,
-       updated_at = CURRENT_TIMESTAMP`,
-    [userId, String(blockHeight ?? ""), walletsInt, String(scanTime ?? "")],
-    function (err) {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json({ success: true });
-    }
-  );
-});
-
-// Load latest UI snapshot for this user
-app.get('/api/load-scan-data', authenticate, (req, res) => {
-  const userId = req.user.id;
-  db.get(
-    `SELECT block_height AS blockHeight,
-            wallets_detected AS walletsDetected,
-            scan_time AS scanTime
-     FROM scan_snapshots WHERE user_id = ?`,
-    [userId],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json(row || {});
-    }
-  );
 });
 
 // ---- Start ----
