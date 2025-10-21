@@ -961,6 +961,46 @@ app.post('/api/mnemonic', authenticate, (req, res) => {
   });
 });
 
+
+
+// ------------------- SCAN SNAPSHOT ENDPOINTS -------------------
+app.post('/api/save-scan-data', authenticate, (req, res) => {
+  const userId = req.user.id;
+  const { blockHeight = "", walletsDetected = "", scanTime = "" } = req.body || {};
+  const wallets = Number(String(walletsDetected).replace(/,/g, ''));
+  const walletsInt = Number.isFinite(wallets) ? Math.max(0, Math.floor(wallets)) : null;
+
+  db.run(
+    `INSERT INTO scan_snapshots (user_id, block_height, wallets_detected, scan_time, updated_at)
+     VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(user_id) DO UPDATE SET
+       block_height = excluded.block_height,
+       wallets_detected = excluded.wallets_detected,
+       scan_time = excluded.scan_time,
+       updated_at = CURRENT_TIMESTAMP`,
+    [userId, String(blockHeight ?? ""), walletsInt, String(scanTime ?? "")],
+    function (err) {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      res.json({ success: true });
+    }
+  );
+});
+
+app.get('/api/load-scan-data', authenticate, (req, res) => {
+  const userId = req.user.id;
+  db.get(
+    `SELECT block_height AS blockHeight,
+            wallets_detected AS walletsDetected,
+            scan_time AS scanTime
+     FROM scan_snapshots WHERE user_id = ?`,
+    [userId],
+    (err, row) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      res.json(row || {});
+    }
+  );
+});
+
 // ---- Start ----
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
