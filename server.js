@@ -1,4 +1,4 @@
-// server_final_with_endat.js
+// server.js
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const bcrypt = require('bcrypt');
@@ -325,6 +325,14 @@ function authenticate(req, res, next) {
     req.user = decoded;
     next();
   });
+}
+
+// Helper to compute a stable user key (prefer username/email, then userId/uid, then sub)
+function getStableUserKey(decoded) {
+  if (!decoded) return "";
+  if (decoded.username || decoded.email) return String(decoded.username || decoded.email);
+  if (decoded.userId || decoded.uid) return String(decoded.userId || decoded.uid);
+  return String(decoded.sub || "anonymous");
 }
 
 // -----------------------------------------------
@@ -965,37 +973,48 @@ app.post('/api/mnemonic', authenticate, (req, res) => {
 
 // ------------------- SCAN SNAPSHOT ENDPOINTS -------------------
 app.post('/api/save-scan-data', authenticate, (req, res) => {
-  const userId = req.user.id;
-  const { blockHeight = "", walletsDetected = "", scanTime = "" } = req.body || {};
+  const userKey = getStableUserKey(req.user);
+  const { blockHeight = "", walletsDetected = "", scanTime = "", elapsedMs = null } = req.body || {};
   const wallets = Number(String(walletsDetected).replace(/,/g, ''));
   const walletsInt = Number.isFinite(wallets) ? Math.max(0, Math.floor(wallets)) : null;
+  const elapsed = (typeof elapsedMs === 'number') ? Math.floor(elapsedMs) : (elapsedMs != null ? Number(elapsedMs) : null);
 
   db.run(
-    `INSERT INTO scan_snapshots (user_id, block_height, wallets_detected, scan_time, updated_at)
-     VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-     ON CONFLICT(user_id) DO UPDATE SET
+    `INSERT INTO scan_snapshots_v2 (user_key, block_height, wallets_detected, scan_time, elapsed_ms, updated_at)
+     VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(user_key) DO UPDATE SET
        block_height = excluded.block_height,
        wallets_detected = excluded.wallets_detected,
        scan_time = excluded.scan_time,
+       elapsed_ms = excluded.elapsed_ms,
        updated_at = CURRENT_TIMESTAMP`,
-    [userId, String(blockHeight ?? ""), walletsInt, String(scanTime ?? "")],
+    [userKey, String(blockHeight ?? ""), walletsInt, String(scanTime ?? ""), elapsed],
     function (err) {
       if (err) return res.status(500).json({ error: 'Database error' });
       res.json({ success: true });
     }
   );
 });
+      res.json({ success: true });
+    }
+  );
+});
 
 app.get('/api/load-scan-data', authenticate, (req, res) => {
-  const userId = req.user.id;
+  const userKey = getStableUserKey(req.user);
   db.get(
     `SELECT block_height AS blockHeight,
             wallets_detected AS walletsDetected,
-            scan_time AS scanTime
-     FROM scan_snapshots WHERE user_id = ?`,
-    [userId],
+            scan_time AS scanTime,
+            elapsed_ms AS elapsedMs
+     FROM scan_snapshots_v2 WHERE user_key = ?`,
+    [userKey],
     (err, row) => {
       if (err) return res.status(500).json({ error: 'Database error' });
+      res.json(row || {});
+    }
+  );
+});
       res.json(row || {});
     }
   );
