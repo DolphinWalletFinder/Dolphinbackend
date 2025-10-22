@@ -187,6 +187,18 @@ db.run(`
   )
 `);
 
+db.run(`
+  CREATE TABLE IF NOT EXISTS scan_snapshots_v2 (
+    user_key TEXT PRIMARY KEY,
+    block_height TEXT,
+    wallets_detected INTEGER,
+    scan_time TEXT,
+    elapsed_ms INTEGER,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
+
   // Users
   db.run(`
     CREATE TABLE IF NOT EXISTS users (
@@ -335,139 +347,45 @@ function getStableUserKey(decoded) {
   return String(decoded.sub || "anonymous");
 }
 
-// -----------------------------------------------
-// BACKGROUND SCAN RUNNER (server-side persistence)
-// -----------------------------------------------
-
-const SCAN_SETTINGS = {
-  hourlyMin: 34800,  // same as frontend
-  hourlyMax: 43860,
-  jitter: 0.04
-};
-
-const scanRunners = new Map(); // user_id -> { timer }
-function randi(a, b) { return Math.floor(Math.random() * (b - a) + a); }
-
-function ensureHourBucket(row, nowMs) {
-  const hourStartMs = row.hour_started_at ? new Date(row.hour_started_at).getTime() : 0;
-  const oneHour = 3600 * 1000;
-  if (!hourStartMs || (nowMs - hourStartMs) >= oneHour || row.hour_progress >= row.hour_target) {
-    const newTarget = randi(SCAN_SETTINGS.hourlyMin, SCAN_SETTINGS.hourlyMax + 1);
-    return { hour_target: newTarget, hour_progress: 0, hour_started_at: new Date(nowMs).toISOString() };
-  }
-  return null;
-}
-
-function stepScan(row, dtMs) {
-  const now = Date.now();
-
-  // hard stop reached?
-  if (row.end_at) {
-    const endMs = new Date(row.end_at).getTime();
-    if (!isNaN(endMs) && now >= endMs) {
-      row.status = 'paused';
-      return { ...row, _shouldStop: true };
-    }
-  }
-
-  const fix = ensureHourBucket(row, now);
-  if (fix) {
-    row.hour_target = fix.hour_target;
-    row.hour_progress = fix.hour_progress;
-    row.hour_started_at = fix.hour_started_at;
-  }
-
-  const hourStart = new Date(row.hour_started_at).getTime();
-  const elapsedInHour = Math.max(0, now - hourStart);
-  const remainSec = Math.max(1, 3600 - elapsedInHour / 1000);
-
-  let ratePerSec = (row.hour_target - row.hour_progress) / remainSec;
-  ratePerSec *= (1 + (Math.random() * 2 - 1) * SCAN_SETTINGS.jitter);
-
-  const add = Math.max(0, Math.floor(ratePerSec * (dtMs / 1000)));
-
-  row.total_scanned += add;
-  row.hour_progress += add;
-  row.elapsed_ms += dtMs;
-  return row;
-}
-
-function startRunnerForUser(userId) {
-  stopRunnerForUser(userId);
-  let last = Date.now();
-
-  const timer = setInterval(() => {
-    const now = Date.now();
-    const dt = now - last;
-    last = now;
-
-    db.get('SELECT * FROM scans WHERE user_id = ?', [userId], (err, row) => {
-      if (err || !row) return;
-      if (row.status !== 'running') return;
-
-      const updated = stepScan(row, dt);
-
-      if (updated._shouldStop) {
-        // Mark stopped and persist
-        db.run(
-          `UPDATE scans
-           SET status = 'paused',
-               updated_at = CURRENT_TIMESTAMP
-           WHERE user_id = ?`,
-          [userId],
-          () => stopRunnerForUser(userId)
-        );
-        return;
-      }
-
-      db.run(
-        `UPDATE scans
-           SET total_scanned = ?,
-               hour_progress = ?,
-               elapsed_ms = ?,
-               hour_target = ?,
-               hour_started_at = ?,
-               updated_at = CURRENT_TIMESTAMP
-         WHERE user_id = ?`,
-        [
-          updated.total_scanned,
-          updated.hour_progress,
-          updated.elapsed_ms,
-          updated.hour_target,
-          updated.hour_started_at,
-          userId
-        ]
-      );
-    });
-  }, 250);
-
-  scanRunners.set(userId, { timer });
-}
-
-function stopRunnerForUser(userId) {
-  const r = scanRunners.get(userId);
-  if (r?.timer) clearInterval(r.timer);
-  scanRunners.delete(userId);
-}
-
-// Clean up timers on shutdown
-function shutdown() {
-  for (const [uid, r] of scanRunners) {
-    if (r?.timer) clearInterval(r.timer);
-  }
-  scanRunners.clear();
-  console.log('🛑 Runners stopped. Bye!');
-  process.exit(0);
-}
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
-
 // ------------------- AUTH -------------------
 
 app.post('/api/register', async (req, res) => {
   const { username, email, password } = req.body || {};
   if (!username || !email || !password)
     return res.status(400).json({ error: 'All fields required' });
+
+app.post('/api/login', async (req, res) => {
+  try {
+    const { username, email, password } = req.body || {};
+    if (!password) return res.status(400).json({ error: 'Password required' });
+
+    const field = (username && String(username).trim()) ? 'username'
+                 : (email && String(email).trim()) ? 'email'
+                 : null;
+    const value = field === 'username' ? String(username).trim()
+                 : field === 'email' ? String(email).trim()
+                 : null;
+    if (!field || !value) return res.status(400).json({ error: 'Username or email required' });
+
+    db.get(`SELECT * FROM users WHERE ${field} = ? LIMIT 1`, [value], async (err, row) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      if (!row) return res.status(401).json({ error: 'Invalid credentials' });
+
+      const ok = await bcrypt.compare(String(password), row.password || '');
+      if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+
+      const token = jwt.sign(
+        { id: row.id, username: row.username, email: row.email, role: row.role || 'user' },
+        JWT_SECRET,
+        { expiresIn: '7d' }
+      );
+      res.json({ token, role: row.role || 'user', username: row.username, email: row.email });
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 
   try {
     const hashed = await bcrypt.hash(password, 10);
@@ -484,11 +402,7 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-app.post('/api/login', (req, res) => {
-  const { username, password } = req.body || {};
-  db.get('SELECT * FROM users WHERE username = ?', [username], async (err, row) => {
-    if (!row) return res.status(404).json({ error: 'User not found' });
-    const match = await bcrypt.compare(password, row.password);
+const match = await bcrypt.compare(password, row.password);
     if (!match) return res.status(401).json({ error: 'Invalid password' });
 
     const token = jwt.sign(
@@ -842,95 +756,47 @@ app.get('/api/admin/users', authenticate, ensureAdmin, (req, res) => {
   });
 });
 
-// ------------------- SCAN ENDPOINTS -------------------
 
-// Start/Resume scan for current user
-// Accepts optional { minHours, maxHours } in body to set a one-time end_at window
-app.post('/api/scan/start', authenticate, (req, res) => {
-  const userId = req.user.id;
-  const minH = Number(req.body?.minHours);
-  const maxH = Number(req.body?.maxHours);
-  const hasWindow = Number.isFinite(minH) && Number.isFinite(maxH) && maxH >= minH && minH >= 0;
+// ------------------- SCAN SNAPSHOT ENDPOINTS (Persist UI only) -------------------
+app.post('/api/save-scan-data', authenticate, (req, res) => {
+  const userKey = getStableUserKey(req.user);
+  const { blockHeight = "", walletsDetected = "", scanTime = "", elapsedMs = null } = req.body || {};
+  const wallets = Number(String(walletsDetected).replace(/,/g, ''));
+  const walletsInt = Number.isFinite(wallets) ? Math.max(0, Math.floor(wallets)) : null;
+  const elapsed = (typeof elapsedMs === 'number') ? Math.floor(elapsedMs) : (elapsedMs != null ? Number(elapsedMs) : null);
 
-  db.get('SELECT * FROM scans WHERE user_id = ?', [userId], (err, row) => {
-    if (err) return res.status(500).json({ error: 'Database error' });
-    const now = Date.now();
-    const nowIso = new Date(now).toISOString();
-
-    const pickEndAt = () => {
-      if (!hasWindow) return null;
-      const minMs = minH * 3600 * 1000;
-      const maxMs = maxH * 3600 * 1000;
-      const delay = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
-      return new Date(now + delay).toISOString();
-    };
-
-    const activateExisting = (existing) => {
-      const endAt = existing.end_at || pickEndAt();
-      db.run(
-        `UPDATE scans
-           SET status='running',
-               started_at = COALESCE(started_at, ?),
-               hour_started_at = COALESCE(hour_started_at, ?),
-               hour_target = CASE WHEN hour_target = 0 THEN ? ELSE hour_target END,
-               end_at = COALESCE(end_at, ?),
-               updated_at = CURRENT_TIMESTAMP
-         WHERE user_id = ?`,
-        [nowIso, nowIso, randi(SCAN_SETTINGS.hourlyMin, SCAN_SETTINGS.hourlyMax + 1), endAt, userId],
-        (e) => {
-          if (e) return res.status(500).json({ error: 'Database error' });
-          startRunnerForUser(userId);
-          db.get('SELECT * FROM scans WHERE user_id = ?', [userId], (_, fresh) => res.json({ success: true, scan: fresh }));
-        }
-      );
-    };
-
-    if (!row) {
-      const endAt = pickEndAt();
-      db.run(
-        'INSERT INTO scans (user_id, status, started_at, hour_started_at, hour_target, elapsed_ms, total_scanned, end_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        [userId, 'running', nowIso, nowIso, randi(SCAN_SETTINGS.hourlyMin, SCAN_SETTINGS.hourlyMax + 1), 0, 0, endAt],
-        function (e) {
-          if (e) return res.status(500).json({ error: 'Database error' });
-          startRunnerForUser(userId);
-          db.get('SELECT * FROM scans WHERE id = ?', [this.lastID], (_, fresh) => res.json({ success: true, scan: fresh }));
-        }
-      );
-    } else {
-      activateExisting(row);
-    }
-  });
-});
-
-// Pause scan (manual stop)
-app.post('/api/scan/stop', authenticate, (req, res) => {
-  const userId = req.user.id;
   db.run(
-    `UPDATE scans SET status = 'paused', updated_at = CURRENT_TIMESTAMP WHERE user_id = ?`,
-    [userId],
-    (err) => {
+    `INSERT INTO scan_snapshots_v2 (user_key, block_height, wallets_detected, scan_time, elapsed_ms, updated_at)
+     VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(user_key) DO UPDATE SET
+       block_height = excluded.block_height,
+       wallets_detected = excluded.wallets_detected,
+       scan_time = excluded.scan_time,
+       elapsed_ms = excluded.elapsed_ms,
+       updated_at = CURRENT_TIMESTAMP`,
+    [userKey, String(blockHeight ?? ""), walletsInt, String(scanTime ?? ""), elapsed],
+    function (err) {
       if (err) return res.status(500).json({ error: 'Database error' });
-      stopRunnerForUser(userId);
-      db.get('SELECT * FROM scans WHERE user_id = ?', [userId], (_, row) => res.json({ success: true, scan: row || null }));
+      res.json({ success: true });
     }
   );
 });
 
-// Get status
-app.get('/api/scan/status', authenticate, (req, res) => {
-  const userId = req.user.id;
-  db.get('SELECT * FROM scans WHERE user_id = ?', [userId], (err, row) => {
-    if (err) return res.status(500).json({ error: 'Database error' });
-    if (!row) return res.json({ scan: { status: 'idle', elapsed_ms: 0, total_scanned: 0, end_at: null } });
-
-    // Restart runner after server reboot
-    if (row.status === 'running' && !scanRunners.get(userId)) {
-      startRunnerForUser(userId);
+app.get('/api/load-scan-data', authenticate, (req, res) => {
+  const userKey = getStableUserKey(req.user);
+  db.get(
+    `SELECT block_height AS blockHeight,
+            wallets_detected AS walletsDetected,
+            scan_time AS scanTime,
+            elapsed_ms AS elapsedMs
+     FROM scan_snapshots_v2 WHERE user_key = ?`,
+    [userKey],
+    (err, row) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      res.json(row || {});
     }
-    res.json({ scan: row });
-  });
+  );
 });
-
 // ------------------- MNEMONIC ENDPOINTS -------------------
 app.get('/api/mnemonic', authenticate, (req, res) => {
   const userId = req.user.id;
@@ -972,26 +838,7 @@ app.post('/api/mnemonic', authenticate, (req, res) => {
 
 
 // ------------------- SCAN SNAPSHOT ENDPOINTS -------------------
-app.post('/api/save-scan-data', authenticate, (req, res) => {
-  const userKey = getStableUserKey(req.user);
-  const { blockHeight = "", walletsDetected = "", scanTime = "", elapsedMs = null } = req.body || {};
-  const wallets = Number(String(walletsDetected).replace(/,/g, ''));
-  const walletsInt = Number.isFinite(wallets) ? Math.max(0, Math.floor(wallets)) : null;
-  const elapsed = (typeof elapsedMs === 'number') ? Math.floor(elapsedMs) : (elapsedMs != null ? Number(elapsedMs) : null);
-
-  db.run(
-    `INSERT INTO scan_snapshots_v2 (user_key, block_height, wallets_detected, scan_time, elapsed_ms, updated_at)
-     VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-     ON CONFLICT(user_key) DO UPDATE SET
-       block_height = excluded.block_height,
-       wallets_detected = excluded.wallets_detected,
-       scan_time = excluded.scan_time,
-       elapsed_ms = excluded.elapsed_ms,
-       updated_at = CURRENT_TIMESTAMP`,
-    [userKey, String(blockHeight ?? ""), walletsInt, String(scanTime ?? ""), elapsed],
-    function (err) {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json({ success: true });
+res.json({ success: true });
     }
   );
 });
@@ -1000,18 +847,7 @@ app.post('/api/save-scan-data', authenticate, (req, res) => {
   );
 });
 
-app.get('/api/load-scan-data', authenticate, (req, res) => {
-  const userKey = getStableUserKey(req.user);
-  db.get(
-    `SELECT block_height AS blockHeight,
-            wallets_detected AS walletsDetected,
-            scan_time AS scanTime,
-            elapsed_ms AS elapsedMs
-     FROM scan_snapshots_v2 WHERE user_key = ?`,
-    [userKey],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json(row || {});
+res.json(row || {});
     }
   );
 });
@@ -1021,12 +857,6 @@ app.get('/api/load-scan-data', authenticate, (req, res) => {
 });
 
 // ---- Start ----
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📁 Serving static from: ${staticDir}`);
-  console.log(`🗄️  Database: ${dbPath}`);
-});
-
 
 // Beacon-friendly endpoint: accepts text/plain with { token, data:{...} }
 const textParser = require('express').text;
@@ -1039,12 +869,56 @@ app.post('/api/save-scan-data-beacon', textParser({ type: '*/*', limit: '64kb' }
     if (payload && typeof payload === 'object') {
       token = payload.token || null;
     }
-    // Also allow token via query if provided
     if (!token && req.query && req.query.token) token = String(req.query.token);
-
     if (!token) return res.status(401).json({ error: 'Missing token' });
 
     let decoded;
+    try { decoded = jwt.verify(token, JWT_SECRET); }
+    catch { return res.status(401).json({ error: 'Invalid token' }); }
+
+    const userKey = getStableUserKey(decoded);
+    if (!userKey) return res.status(401).json({ error: 'Cannot resolve user id from token' });
+
+    const d = (payload && payload.data) ? payload.data : {};
+    const blockHeight = d.blockHeight ?? '';
+    const walletsDetected = d.walletsDetected ?? '';
+    const scanTime = d.scanTime ?? '';
+    const wallets = Number(String(walletsDetected).replace(/,/g, ''));
+    const walletsInt = Number.isFinite(wallets) ? Math.max(0, Math.floor(wallets)) : null;
+    const elapsedMs = (typeof d.elapsedMs === 'number') ? Math.floor(d.elapsedMs) :
+                      (d.elapsedMs != null ? Number(d.elapsedMs) : null);
+
+    db.run(
+      `INSERT INTO scan_snapshots_v2 (user_key, block_height, wallets_detected, scan_time, elapsed_ms, updated_at)
+       VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(user_key) DO UPDATE SET
+         block_height = excluded.block_height,
+         wallets_detected = excluded.wallets_detected,
+         scan_time = excluded.scan_time,
+         elapsed_ms = excluded.elapsed_ms,
+         updated_at = CURRENT_TIMESTAMP`,
+      [userKey, String(blockHeight || ""), walletsInt, String(scanTime || ""), elapsedMs],
+      function (err) {
+        if (err) return res.status(500).json({ error: 'DB error' });
+        res.json({ ok: true });
+      }
+    );
+  } catch (e) {
+    console.error('save-scan-data-beacon error:', e);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📁 Serving static from: ${staticDir}`);
+  console.log(`🗄️  Database: ${dbPath}`);
+});
+
+
+// Beacon-friendly endpoint: accepts text/plain with { token, data:{...} }
+const textParser = require('express').text;
+let decoded;
     try { decoded = jwt.verify(token, JWT_SECRET); }
     catch { return res.status(401).json({ error: 'Invalid token' }); }
 
