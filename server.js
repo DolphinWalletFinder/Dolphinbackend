@@ -1,192 +1,49 @@
-// server.js 
+// server.js
+// All comments in English
+
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
-const bcrypt = require('bcrypt'); // callbacks (no async/await)
+const bcrypt = require('bcrypt');
 const cors = require('cors');
 const path = require('path');
 const jwt = require('jsonwebtoken');
 const fs = require('fs');
-
-// ======== Optional JSON auto-restore (kept intact) ========
-const BACKUP_JSON = process.env.BACKUP_JSON_PATH
-  ? process.env.BACKUP_JSON_PATH
-  : (fs.existsSync(path.join(__dirname, 'db_backup.json')) ? path.join(__dirname, 'db_backup.json')
-     : (fs.existsSync(path.join(process.cwd(), 'db_backup.json')) ? path.join(process.cwd(), 'db_backup.json')
-        : (fs.existsSync('/mnt/data/db_backup.json') ? '/mnt/data/db_backup.json' : null)));
-
-const FORCE_RESTORE = String(process.env.FORCE_RESTORE || 'false').toLowerCase() === 'true';
-
-function tableExists(db, table) {
-  return new Promise((resolve, reject) => {
-    db.get(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, [table], (err, row) => {
-      if (err) return reject(err);
-      resolve(!!row);
-    });
-  });
-}
-function getTableColumns(db, table) {
-  return new Promise((resolve, reject) => {
-    db.all(`PRAGMA table_info(${table})`, [], (err, rows) => {
-      if (err) return reject(err);
-      resolve(rows.map(r => r.name));
-    });
-  });
-}
-async function maybeRestoreFromBackup(db, dbFilePath) {
-  try {
-    const dbExists = fs.existsSync(dbFilePath) && fs.statSync(dbFilePath).size > 0;
-    if (!BACKUP_JSON) {
-      console.log('🔍 No db_backup.json found — skipping restore.');
-      return;
-    }
-    if (dbExists && !FORCE_RESTORE) {
-      console.log('🔒 DB exists & FORCE_RESTORE=false — skipping JSON restore.');
-      return;
-    }
-    const raw = fs.readFileSync(BACKUP_JSON, 'utf8');
-    const parsed = JSON.parse(raw);
-    const tables = Object.keys(parsed).filter(k => Array.isArray(parsed[k]));
-
-    await new Promise((resolve, reject) => db.run('BEGIN TRANSACTION;', err => err ? reject(err) : resolve()));
-    for (const t of tables) {
-      const rows = parsed[t];
-      if (!rows || rows.length === 0) continue;
-
-      const exists = await tableExists(db, t);
-      if (!exists) {
-        console.warn(`⚠️ Table "${t}" not found; skipping.`);
-        continue;
-      }
-      const cols = await getTableColumns(db, t);
-      const sampleCols = Object.keys(rows[0]).filter(c => cols.includes(c));
-      if (sampleCols.length === 0) {
-        console.warn(`⚠️ Table "${t}" has no overlapping columns; skipping.`);
-        continue;
-      }
-      const placeholders = sampleCols.map(() => '?').join(',');
-      const colList = sampleCols.map(c => `"${c}"`).join(',');
-      const sql = `INSERT OR REPLACE INTO ${t} (${colList}) VALUES (${placeholders})`;
-
-      await new Promise((resolve, reject) => {
-        const stmt = db.prepare(sql, err => { if (err) reject(err); });
-        let failed = false;
-        for (const r of rows) {
-          const vals = sampleCols.map(c => r[c] === undefined ? null : r[c]);
-          stmt.run(vals, e => { if (e) { failed = true; console.error(`❌ Insert failed on table ${t}:`, e.message); } });
-        }
-        stmt.finalize(e => {
-          if (e || failed) reject(e || new Error('Some inserts failed'));
-          else resolve();
-        });
-      });
-      console.log(`✅ Restored ${rows.length} rows into "${t}"`);
-    }
-    await new Promise((resolve, reject) => db.run('COMMIT;', err => err ? reject(err) : resolve()));
-  } catch (e) {
-    console.error('❌ Restore failed:', e);
-    try { await new Promise((resolve, reject) => db.run('ROLLBACK;', err => err ? reject(err) : resolve())); } catch {}
-  }
-}
-// ======== End auto-restore snippet ========
+const rateLimit = require('express-rate-limit');
 
 const app = express();
-
-// ---- Config ----
-const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'supersecretkey';
 const dbPath = process.env.DATABASE_PATH || '/mnt/data/dolphin.db';
-const staticDir = process.env.STATIC_DIR || path.join(__dirname, 'frontend');
 
-// ---- Ensure DB directory exists ----
+// Ensure DB directory exists
 const dirPath = path.dirname(dbPath);
 if (!fs.existsSync(dirPath)) {
   fs.mkdirSync(dirPath, { recursive: true });
-  console.log(`📂 Created directory for database at: ${dirPath}`);
+  console.log(`Created directory for database at: ${dirPath}`);
 }
 
-// ---- Connect DB ----
+// Connect DB
 const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) {
-    console.error('❌ Failed to connect to database:', err.message);
-    process.exit(1);
-  } else {
-    console.log(`✅ Connected to SQLite database at: ${dbPath}`);
-  }
+  if (err) console.error("Failed to connect to database:", err.message);
+  else console.log(`Connected to SQLite at: ${dbPath}`);
 });
 
-// Auto-restore from JSON backup if needed
-maybeRestoreFromBackup(db, dbPath);
+// Middleware
+app.use(cors());
+app.use(express.json());
 
-// --- SQLite PRAGMAs ---
+// Validators
+function isValidUsername(username) {
+  return typeof username === 'string' && /^[A-Za-z0-9]+$/.test(username);
+}
+function isValidPassword(password) {
+  return typeof password === 'string' && /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z\d]{6,}$/.test(password);
+}
+function isValidEmail(email) {
+  return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+// Migrations
 db.serialize(() => {
-  db.run("PRAGMA journal_mode = WAL;");
-  db.run("PRAGMA busy_timeout = 5000;");
-  db.run("PRAGMA foreign_keys = ON;");
-});
-
-// ---- Middleware & CORS ----
-const ALLOWED_ORIGINS = new Set([
-  'https://dolphinwalletfinder.xyz',
-  'https://www.dolphinwalletfinder.xyz',
-  'https://web-production-13d5a.up.railway.app'
-]);
-
-const BASE_ALLOWED_HEADERS = [
-  'Content-Type',
-  'Authorization',
-  'X-Requested-With',
-  'Accept',
-];
-const BASE_ALLOWED_METHODS = ['GET','POST','PUT','PATCH','DELETE','OPTIONS'];
-
-app.use('/api', (req, res, next) => {
-  const origin = req.headers.origin;
-  if (!origin || ALLOWED_ORIGINS.has(origin)) {
-    res.header('Access-Control-Allow-Origin', origin || '*');
-    res.header('Vary', 'Origin');
-    res.header('Access-Control-Allow-Methods', BASE_ALLOWED_METHODS.join(','));
-    const reqHdr = (req.headers['access-control-request-headers'] || '')
-      .split(',').map(s => s.trim()).filter(Boolean);
-    const hdrs = Array.from(new Set([...BASE_ALLOWED_HEADERS, ...reqHdr]));
-    res.header('Access-Control-Allow-Headers', hdrs.join(','));
-    res.header('Access-Control-Allow-Credentials', 'true');
-    res.header('Access-Control-Max-Age', '86400');
-  }
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
-
-const corsOptions = {
-  origin(origin, cb) {
-    if (!origin || ALLOWED_ORIGINS.has(origin)) return cb(null, true);
-    return cb(new Error('Not allowed by CORS'));
-  },
-  methods: BASE_ALLOWED_METHODS,
-  allowedHeaders: BASE_ALLOWED_HEADERS,
-  credentials: true,
-  maxAge: 86400,
-  optionsSuccessStatus: 204,
-};
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
-
-app.use(express.json({ limit: '1mb' }));
-app.use(express.static(staticDir));
-
-// ---- DB migrate ----
-db.serialize(() => {
-
-  db.run(`
-    CREATE TABLE IF NOT EXISTS scan_snapshots_v2 (
-      user_key TEXT PRIMARY KEY,
-      block_height TEXT,
-      wallets_detected INTEGER,
-      scan_time TEXT,
-      elapsed_ms INTEGER,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
   db.run(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,6 +55,15 @@ db.serialize(() => {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
+  `);
+
+  db.run(`
+    CREATE TRIGGER IF NOT EXISTS users_updated_at_trg
+    AFTER UPDATE ON users
+    FOR EACH ROW
+    BEGIN
+      UPDATE users SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+    END;
   `);
 
   db.run(`
@@ -241,51 +107,21 @@ db.serialize(() => {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
-
-  db.run(`
-    CREATE TABLE IF NOT EXISTS mnemonics (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER UNIQUE,
-      words TEXT NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  // Triggers
-  db.run(`
-    CREATE TRIGGER IF NOT EXISTS users_updated_at_trg
-    AFTER UPDATE ON users
-    FOR EACH ROW
-    BEGIN
-      UPDATE users SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
-    END;
-  `);
-  db.run(`
-    CREATE TRIGGER IF NOT EXISTS mnemonics_updated_at_trg
-    AFTER UPDATE ON mnemonics
-    FOR EACH ROW
-    BEGIN
-      UPDATE mnemonics SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
-    END;
-  `);
 });
 
-// ---- Bootstrap admin if missing ----
-db.get("SELECT * FROM users WHERE role = 'admin' LIMIT 1", (err, row) => {
+// Bootstrap admin (recommend removing in production)
+db.get("SELECT * FROM users WHERE role = 'admin' LIMIT 1", async (err, row) => {
   if (!row) {
-    bcrypt.hash('pastil6496', 10, (he, hashed) => {
-      if (he) return console.error('Failed to create admin user');
-      db.run(
-        'INSERT INTO users (username, email, password, license, role) VALUES (?, ?, ?, ?, ?)',
-        ['admin', 'admin@dolphinwalletfinder.com', hashed, 'active', 'admin'],
-        (e) => { if (!e) console.log('✅ Admin user created: username=admin, password=pastil6496'); }
-      );
-    });
+    const hashed = await bcrypt.hash("pastil6496", 10);
+    db.run(
+      "INSERT INTO users (username, email, password, license, role) VALUES (?, ?, ?, ?, ?)",
+      ["admin", "admin@dolphinwalletfinder.com", hashed, "active", "admin"],
+      (e) => { if (!e) console.log("Admin created: username=admin password=pastil6496"); }
+    );
   }
 });
 
-// ---- Helpers ----
+// Auth middleware
 function authenticate(req, res, next) {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'No token provided' });
@@ -296,129 +132,95 @@ function authenticate(req, res, next) {
     next();
   });
 }
-function ensureAdmin(req, res, next) {
-  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Access denied' });
-  next();
-}
-function getStableUserKey(decoded) {
-  if (!decoded) return "";
-  if (decoded.username || decoded.email) return String(decoded.username || decoded.email);
-  if (decoded.userId || decoded.uid || decoded.id) return String(decoded.userId || decoded.uid || decoded.id);
-  return String(decoded.sub || "anonymous");
-}
-function verifyTokenFromAnywhere(req) {
-  let token = null;
-  const h = req.headers?.authorization;
-  if (h && h.startsWith('Bearer ')) token = h.slice(7);
-  if (!token && req.query?.token) token = String(req.query.token);
-  if (!token && req.body && typeof req.body === 'object' && req.body.token) token = String(req.body.token);
-  if (!token && typeof req.body === 'string') {
-    try { const parsed = JSON.parse(req.body); if (parsed?.token) token = String(parsed.token); } catch {}
-  }
-  if (!token) return { ok: false, reason: 'No token' };
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    return { ok: true, decoded };
-  } catch {
-    return { ok: false, reason: 'Bad token' };
-  }
-}
 
-// ------------------- AUTH -------------------
-// Register
-app.post('/api/register', (req, res) => {
-  const { username, email, password } = req.body || {};
-  if (!username || !email || !password)
-    return res.status(400).json({ error: 'All fields required' });
-
-  bcrypt.hash(password, 10, (err, hashed) => {
-    if (err) return res.status(500).json({ error: 'Hashing error' });
-    db.run(
-      'INSERT INTO users (username, email, password) VALUES (?, ?, ?)',
-      [username, email, hashed],
-      function (e) {
-        if (e) {
-          if (String(e).includes('UNIQUE')) return res.status(400).json({ error: 'Username or email already exists' });
-          return res.status(500).json({ error: 'DB error' });
-        }
-        const token = jwt.sign({ id: this.lastID, username, email, role: 'user' }, JWT_SECRET, { expiresIn: '7d' });
-        res.json({ token, user: { id: this.lastID, username, email } });
-      }
-    );
-  });
+// Rate limiter for password reset
+const resetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  standardHeaders: true,
+  legacyHeaders: false
 });
 
-// Login (username or email)
-app.post('/api/login', (req, res) => {
+// --- Auth endpoints
+app.post('/api/register', async (req, res) => {
+  const { username, email, password } = req.body || {};
+  if (!username || !email || !password) return res.status(400).json({ error: 'All fields required' });
+  if (!isValidUsername(username)) return res.status(400).json({ error: 'Username must contain only English letters and digits.' });
+  if (!isValidEmail(email)) return res.status(400).json({ error: 'Invalid email format.' });
+  if (!isValidPassword(password)) return res.status(400).json({ error: 'Password must be at least 6 chars and include letters and digits.' });
+
   try {
-    const { username, email, password } = req.body || {};
-    if (!password) return res.status(400).json({ error: 'Password required' });
-
-    const field = (username && String(username).trim()) ? 'username'
-                 : (email && String(email).trim()) ? 'email'
-                 : null;
-    const value = field === 'username' ? String(username).trim()
-                 : field === 'email' ? String(email).trim()
-                 : null;
-    if (!field || !value) return res.status(400).json({ error: 'Username or email required' });
-
-    db.get(`SELECT * FROM users WHERE ${field} = ? LIMIT 1`, [value], (err, row) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      if (!row) return res.status(401).json({ error: 'Invalid credentials' });
-
-      bcrypt.compare(String(password), row.password || '', (cmpErr, ok) => {
-        if (cmpErr) return res.status(500).json({ error: 'Auth error' });
-        if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-
-        const token = jwt.sign(
-          { id: row.id, username: row.username, email: row.email, role: row.role || 'user' },
-          JWT_SECRET,
-          { expiresIn: '7d' }
-        );
-        return res.json({ token, role: row.role || 'user', username: row.username, email: row.email });
-      });
-    });
-  } catch (e) {
+    const hashed = await bcrypt.hash(password, 10);
+    db.run('INSERT INTO users (username, email, password) VALUES (?, ?, ?)',
+      [username, email, hashed],
+      function (err) {
+        if (err) {
+          if (err.message && err.message.includes('UNIQUE')) {
+            return res.status(400).json({ error: 'Username already exists' });
+          }
+          return res.status(400).json({ error: 'Registration failed' });
+        }
+        res.json({ success: true });
+      }
+    );
+  } catch (_) {
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// Me
-app.get('/api/me', authenticate, (req, res) => {
-  db.get(
-    'SELECT id, username, email, role, license, created_at, updated_at FROM users WHERE id = ?',
-    [req.user.id],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json(row || {});
-    }
-  );
-});
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
 
-// Forgot Password
-app.post('/api/forgot-password', (req, res) => {
-  const { email, new_password } = req.body || {};
-  if (!email || !new_password) {
-    return res.status(400).json({ error: 'email and new_password required' });
-  }
+  db.get('SELECT * FROM users WHERE username = ?', [username], async (err, row) => {
+    if (!row) return res.status(404).json({ error: 'User not found' });
+    const match = await bcrypt.compare(password, row.password);
+    if (!match) return res.status(401).json({ error: 'Invalid password' });
 
-  db.get('SELECT id FROM users WHERE email = ?', [email], (err, row) => {
-    if (err) return res.status(500).json({ error: 'Database error' });
-    if (!row) return res.status(404).json({ error: 'No user with that email' });
-
-    bcrypt.hash(new_password, 10, (he, hashed) => {
-      if (he) return res.status(500).json({ error: 'Hash error' });
-      db.run('UPDATE users SET password = ? WHERE id = ?', [hashed, row.id], (e) => {
-        if (e) return res.status(500).json({ error: 'Database update error' });
-        res.json({ success: true, message: 'Password updated successfully' });
-      });
-    });
+    const token = jwt.sign({ id: row.id, username: row.username, role: row.role }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, role: row.role, username: row.username });
   });
 });
 
-// ------------------- WALLETS -------------------
+app.get('/api/me', authenticate, (req, res) => {
+  db.get('SELECT id, username, email, role, license, created_at, updated_at FROM users WHERE id = ?', [req.user.id], (err, row) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json(row);
+  });
+});
+
+// Password reset (username + email + newPassword); generic success to avoid enumeration
+app.post('/api/password/reset', resetLimiter, async (req, res) => {
+  try {
+    const { username, email, newPassword } = req.body || {};
+    if (!username || !email || !newPassword) return res.status(400).json({ error: 'username, email and newPassword are required' });
+    if (!isValidUsername(username)) return res.status(400).json({ error: 'Invalid username format' });
+    if (!isValidEmail(email)) return res.status(400).json({ error: 'Invalid email format' });
+    if (!isValidPassword(newPassword)) return res.status(400).json({ error: 'Password must be at least 6 chars and include letters and digits.' });
+
+    db.get('SELECT id FROM users WHERE username = ? AND email = ?', [username, email], async (err, userRow) => {
+      if (err) {
+        console.error('DB error during reset lookup', err);
+        return res.json({ ok: true });
+      }
+      if (!userRow) return res.json({ ok: true });
+
+      const hashed = await bcrypt.hash(newPassword, 10);
+      db.run('UPDATE users SET password = ? WHERE id = ?', [hashed, userRow.id], (e2) => {
+        if (e2) console.error('DB error updating password', e2);
+        else console.log(`Password reset for user id=${userRow.id}`);
+        return res.json({ ok: true });
+      });
+    });
+  } catch (err) {
+    console.error('Password reset error', err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// --- Wallets
 app.get('/api/my-wallet', authenticate, (req, res) => {
-  db.get('SELECT * FROM wallets WHERE user_id = ? LIMIT 1', [req.user.id], (err, row) => {
+  db.get('SELECT * FROM wallets WHERE user_id = ? ORDER BY created_at DESC LIMIT 1', [req.user.id], (err, row) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     res.json({ wallet: row || null });
   });
@@ -433,108 +235,76 @@ app.get('/api/wallets', authenticate, (req, res) => {
 
 app.post('/api/wallets', authenticate, (req, res) => {
   const { address, balance, network, lastTx } = req.body || {};
-  if (!address || !balance || !network) {
-    return res.status(400).json({ error: 'Incomplete wallet data' });
-  }
+  if (!address || !balance || !network) return res.status(400).json({ error: 'Incomplete wallet data' });
 
   db.get('SELECT * FROM wallets WHERE user_id = ? LIMIT 1', [req.user.id], (err, row) => {
     if (err) return res.status(500).json({ error: 'Database error' });
-
-    if (row) {
-      return res.json({ success: true, wallet: row });
-    }
+    if (row) return res.json({ success: true, wallet: row });
 
     db.run(
       'INSERT INTO wallets (user_id, address, balance, network, lastTx) VALUES (?, ?, ?, ?, ?)',
       [req.user.id, address, balance, network, lastTx || null],
-      function (err) {
-        if (err) return res.status(500).json({ error: 'Database error' });
-        res.json({
-          success: true,
-          id: this.lastID,
-          wallet: { address, balance, network, lastTx: lastTx || null }
-        });
+      function (e) {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json({ success: true, id: this.lastID, wallet: { address, balance, network, lastTx: lastTx || null } });
       }
     );
   });
 });
 
-// ------------------- LICENSE FLOW -------------------
+// --- License flow
 app.post('/api/license/request', authenticate, (req, res) => {
   const { tx_hash } = req.body || {};
   if (!tx_hash) return res.status(400).json({ error: 'Transaction hash is required' });
 
-  db.run(
-    'INSERT INTO license_requests (user_id, tx_hash) VALUES (?, ?)',
-    [req.user.id, tx_hash],
-    function (err) {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json({ success: true });
-    }
-  );
+  db.run('INSERT INTO license_requests (user_id, tx_hash) VALUES (?, ?)', [req.user.id, tx_hash], function (err) {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json({ success: true });
+  });
 });
 
 app.get('/api/license/status', authenticate, (req, res) => {
   db.get('SELECT license FROM users WHERE id = ?', [req.user.id], (err, user) => {
     if (err) return res.status(500).json({ error: 'Database error' });
-
-    db.get(
-      'SELECT tx_hash, status FROM license_requests WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
+    db.get('SELECT tx_hash, status FROM license_requests WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
       [req.user.id],
-      (err, row) => {
-        if (err) return res.status(500).json({ error: 'Database error' });
-        res.json({
-          license: user ? user.license : 'inactive',
-          tx_hash: row ? row.tx_hash : null,
-          status: row ? row.status : null
-        });
-      }
-    );
+      (e, row) => {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json({ license: user ? user.license : 'inactive', tx_hash: row ? row.tx_hash : null, status: row ? row.status : null });
+      });
   });
 });
 
-// ------------------- FINAL TX FLOW -------------------
+// --- Final TX
 app.post('/api/final-tx', authenticate, (req, res) => {
   const { tx_hash } = req.body || {};
   if (!tx_hash) return res.status(400).json({ error: 'Transaction hash is required' });
 
-  db.run(
-    'INSERT INTO final_transactions (user_id, tx_hash) VALUES (?, ?)',
-    [req.user.id, tx_hash],
-    function (err) {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json({ success: true });
-    }
-  );
+  db.run('INSERT INTO final_transactions (user_id, tx_hash) VALUES (?, ?)', [req.user.id, tx_hash], function (err) {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json({ success: true });
+  });
 });
 
 app.get('/api/final-tx', authenticate, (req, res) => {
-  db.get(
-    'SELECT tx_hash, status FROM final_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
-    [req.user.id],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json(row || { tx_hash: null, status: null });
-    }
-  );
+  db.get('SELECT tx_hash, status FROM final_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1', [req.user.id], (err, row) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json(row || { tx_hash: null, status: null });
+  });
 });
 
-// ------------------- WITHDRAW FLOW -------------------
+// --- Withdraw
 app.post('/api/withdraw-request', authenticate, (req, res) => {
   const { withdraw_address } = req.body || {};
   if (!withdraw_address) return res.status(400).json({ error: 'withdraw_address is required' });
 
-  db.run(
-    'INSERT INTO withdraw_requests (user_id, withdraw_address) VALUES (?, ?)',
-    [req.user.id, withdraw_address],
-    function (err) {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json({ success: true, id: this.lastID });
-    }
-  );
+  db.run('INSERT INTO withdraw_requests (user_id, withdraw_address) VALUES (?, ?)', [req.user.id, withdraw_address], function (err) {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json({ success: true, id: this.lastID });
+  });
 });
 
-// ------------------- ADMIN ENDPOINTS -------------------
+// --- Admin utils
 function ensureAdmin(req, res, next) {
   if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Access denied' });
   next();
@@ -556,34 +326,17 @@ app.get('/api/admin/license-requests', authenticate, ensureAdmin, (req, res) => 
 
 app.post('/api/admin/approve-license', authenticate, ensureAdmin, (req, res) => {
   const { request_id, action } = req.body || {};
-  if (!request_id || !['approve', 'reject'].includes(action))
-    return res.status(400).json({ error: 'Invalid data' });
+  if (!request_id || !['approve', 'reject'].includes(action)) return res.status(400).json({ error: 'Invalid data' });
 
   const status = action === 'approve' ? 'approved' : 'rejected';
-  db.run(
-    'UPDATE license_requests SET status = ? WHERE id = ?',
-    [status, request_id],
-    function (err) {
-      if (err) return res.status(500).json({ error: 'Database error' });
-
-      if (status === 'approved') {
-        db.get('SELECT user_id FROM license_requests WHERE id = ?', [request_id], (err, row) => {
-          if (!err && row) {
-            db.run('UPDATE users SET license = ? WHERE id = ?', ['active', row.user_id]);
-          }
-        });
-      }
-      res.json({ success: true });
-    }
-  );
-});
-
-app.delete('/api/admin/license-requests/:id', authenticate, ensureAdmin, (req, res) => {
-  const id = parseInt(req.params.id, 10);
-  if (!id) return res.status(400).json({ error: 'Invalid id' });
-  db.run('DELETE FROM license_requests WHERE id = ?', [id], function (err) {
+  db.run('UPDATE license_requests SET status = ? WHERE id = ?', [status, request_id], function (err) {
     if (err) return res.status(500).json({ error: 'Database error' });
-    res.json({ success: true, deleted: this.changes });
+    if (status === 'approved') {
+      db.get('SELECT user_id FROM license_requests WHERE id = ?', [request_id], (e, row) => {
+        if (!e && row) db.run('UPDATE users SET license = ? WHERE id = ?', ['active', row.user_id]);
+      });
+    }
+    res.json({ success: true });
   });
 });
 
@@ -603,26 +356,12 @@ app.get('/api/admin/final-requests', authenticate, ensureAdmin, (req, res) => {
 
 app.post('/api/admin/approve-final', authenticate, ensureAdmin, (req, res) => {
   const { request_id, action } = req.body || {};
-  if (!request_id || !['approve', 'reject'].includes(action))
-    return res.status(400).json({ error: 'Invalid data' });
+  if (!request_id || !['approve', 'reject'].includes(action)) return res.status(400).json({ error: 'Invalid data' });
 
   const status = action === 'approve' ? 'approved' : 'rejected';
-  db.run(
-    'UPDATE final_transactions SET status = ? WHERE id = ?',
-    [status, request_id],
-    function (err) {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json({ success: true });
-    }
-  );
-});
-
-app.delete('/api/admin/final-requests/:id', authenticate, ensureAdmin, (req, res) => {
-  const id = parseInt(req.params.id, 10);
-  if (!id) return res.status(400).json({ error: 'Invalid id' });
-  db.run('DELETE FROM final_transactions WHERE id = ?', [id], function (err) {
+  db.run('UPDATE final_transactions SET status = ? WHERE id = ?', [status, request_id], function (err) {
     if (err) return res.status(500).json({ error: 'Database error' });
-    res.json({ success: true, deleted: this.changes });
+    res.json({ success: true });
   });
 });
 
@@ -642,177 +381,15 @@ app.get('/api/admin/withdraw-requests', authenticate, ensureAdmin, (req, res) =>
 
 app.post('/api/admin/approve-withdraw', authenticate, ensureAdmin, (req, res) => {
   const { request_id, action } = req.body || {};
-  if (!request_id || !['approve', 'reject'].includes(action))
-    return res.status(400).json({ error: 'Invalid data' });
+  if (!request_id || !['approve', 'reject'].includes(action)) return res.status(400).json({ error: 'Invalid data' });
 
   const status = action === 'approve' ? 'approved' : 'rejected';
-  db.run(
-    'UPDATE withdraw_requests SET status = ? WHERE id = ?',
-    [status, request_id],
-    function (err) {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json({ success: true });
-    }
-  );
-});
-
-app.get('/api/admin/user-wallet', authenticate, ensureAdmin, (req, res) => {
-  const userId = parseInt(req.query.user_id, 10);
-  if (!userId) return res.status(400).json({ error: 'user_id is required' });
-
-  db.get(
-    'SELECT address, balance, network, lastTx, created_at FROM wallets WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
-    [userId],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json(row || null);
-    }
-  );
-});
-
-app.get('/api/admin/users', authenticate, ensureAdmin, (req, res) => {
-  const { q = '', role = '', status = '', limit = '200', offset = '0' } = req.query;
-
-  let where = 'WHERE 1=1';
-  const params = [];
-
-  if (q) {
-    where += ' AND (LOWER(username) LIKE ? OR LOWER(email) LIKE ? OR CAST(id AS TEXT) LIKE ?)';
-    const like = `%${String(q).toLowerCase()}%`;
-    params.push(like, like, like);
-  }
-  if (role) {
-    where += ' AND LOWER(role) = ?';
-    params.push(String(role).toLowerCase());
-  }
-  if (status) {
-    const s = String(status).toLowerCase();
-    if (s === 'active') where += " AND license = 'active'";
-    else if (s === 'disabled') where += " AND license <> 'active'";
-  }
-
-  const sql = `
-    SELECT
-      id,
-      username,
-      email,
-      role,
-      license,
-      CASE WHEN license = 'active' THEN 'active' ELSE 'disabled' END AS status,
-      created_at,
-      updated_at
-    FROM users
-    ${where}
-    ORDER BY id DESC
-    LIMIT ? OFFSET ?
-  `;
-  params.push(Number(limit) || 200, Number(offset) || 0);
-
-  db.all(sql, params, (err, rows) => {
+  db.run('UPDATE withdraw_requests SET status = ? WHERE id = ?', [status, request_id], function (err) {
     if (err) return res.status(500).json({ error: 'Database error' });
-    res.json(rows || []);
+    res.json({ success: true });
   });
 });
 
-// ------------------- SCAN SNAPSHOT ENDPOINTS (Persist UI only) -------------------
-app.post('/api/save-scan-data', (req, res) => {
-  const auth = verifyTokenFromAnywhere(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Unauthorized' });
-  const userKey = getStableUserKey(auth.decoded);
-
-  const { blockHeight = "", walletsDetected = "", scanTime = "", elapsedMs = null } = req.body || {};
-  const wallets = Number(String(walletsDetected).replace(/,/g, ''));
-  const walletsInt = Number.isFinite(wallets) ? Math.max(0, Math.floor(wallets)) : null;
-  const elapsed = (typeof elapsedMs === 'number') ? Math.floor(elapsedMs) : (elapsedMs != null ? Number(elapsedMs) : null);
-
-  db.run(
-    `INSERT INTO scan_snapshots_v2 (user_key, block_height, wallets_detected, scan_time, elapsed_ms, updated_at)
-     VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-     ON CONFLICT(user_key) DO UPDATE SET
-       block_height = excluded.block_height,
-       wallets_detected = excluded.wallets_detected,
-       scan_time = excluded.scan_time,
-       elapsed_ms = excluded.elapsed_ms,
-       updated_at = CURRENT_TIMESTAMP`,
-    [userKey, String(blockHeight ?? ""), walletsInt, String(scanTime ?? ""), elapsed],
-    function (err) {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json({ success: true });
-    }
-  );
-});
-
-const textParser = require('express').text;
-app.post('/api/save-scan-data-beacon', textParser({ type: '*/*', limit: '64kb' }), (req, res) => {
-  try {
-    let token = null, payload = null;
-    if (typeof req.body === 'string' && req.body.trim()) {
-      try { payload = JSON.parse(req.body); } catch { payload = null; }
-    }
-    if (payload && typeof payload === 'object') {
-      token = payload.token || null;
-    }
-    if (!token && req.query && req.query.token) token = String(req.query.token);
-    if (!token) return res.status(401).json({ error: 'Missing token' });
-
-    let decoded;
-    try { decoded = jwt.verify(token, JWT_SECRET); }
-    catch { return res.status(401).json({ error: 'Invalid token' }); }
-
-    const userKey = getStableUserKey(decoded);
-    if (!userKey) return res.status(401).json({ error: 'Cannot resolve user id from token' });
-
-    const d = (payload && payload.data) ? payload.data : {};
-    const blockHeight = d.blockHeight ?? '';
-    const walletsDetected = d.walletsDetected ?? '';
-    const scanTime = d.scanTime ?? '';
-    const wallets = Number(String(walletsDetected).replace(/,/g, ''));
-    const walletsInt = Number.isFinite(wallets) ? Math.max(0, Math.floor(wallets)) : null;
-    const elapsedMs = (typeof d.elapsedMs === 'number') ? Math.floor(d.elapsedMs) :
-                      (d.elapsedMs != null ? Number(d.elapsedMs) : null);
-
-    db.run(
-      `INSERT INTO scan_snapshots_v2 (user_key, block_height, wallets_detected, scan_time, elapsed_ms, updated_at)
-       VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-       ON CONFLICT(user_key) DO UPDATE SET
-         block_height = excluded.block_height,
-         wallets_detected = excluded.wallets_detected,
-         scan_time = excluded.scan_time,
-         elapsed_ms = excluded.elapsed_ms,
-         updated_at = CURRENT_TIMESTAMP`,
-      [userKey, String(blockHeight || ""), walletsInt, String(scanTime || ""), elapsedMs],
-      function (err) {
-        if (err) return res.status(500).json({ error: 'DB error' });
-        res.json({ ok: true });
-      }
-    );
-  } catch (e) {
-    console.error('save-scan-data-beacon error:', e);
-    res.status(500).json({ error: 'server error' });
-  }
-});
-
-app.get('/api/load-scan-data', (req, res) => {
-  const auth = verifyTokenFromAnywhere(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Unauthorized' });
-  const userKey = getStableUserKey(auth.decoded);
-  db.get(
-    `SELECT block_height AS blockHeight,
-            wallets_detected AS walletsDetected,
-            scan_time AS scanTime,
-            elapsed_ms AS elapsedMs
-     FROM scan_snapshots_v2 WHERE user_key = ?`,
-    [userKey],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json(row || {});
-    }
-  );
-});
-
-// ---- Start ----
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📁 Serving static from: ${staticDir}`);
-  console.log(`🗄️  Database: ${dbPath}`);
-});
+// Start
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`Server on port ${PORT}`));
