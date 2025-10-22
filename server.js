@@ -183,7 +183,19 @@ db.run(`
     block_height TEXT,
     wallets_detected INTEGER,
     scan_time TEXT,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    elapsed_ms INTEGER,
+    updated_at DATETIME DEFAU
+
+  // Migration: ensure 'elapsed_ms' column exists (safe for older DBs)
+  db.all("PRAGMA table_info(scan_snapshots)", (err, rows) => {
+    if (!err && rows && !rows.some(r => r.name === 'elapsed_ms')) {
+      db.run("ALTER TABLE scan_snapshots ADD COLUMN elapsed_ms INTEGER", [], (e) => {
+        if (e) console.error("Migration error (add elapsed_ms):", e);
+        else console.log("Added column elapsed_ms to scan_snapshots");
+      });
+    }
+  });
+LT CURRENT_TIMESTAMP
   )
 `);
 
@@ -971,14 +983,15 @@ app.post('/api/save-scan-data', authenticate, (req, res) => {
   const walletsInt = Number.isFinite(wallets) ? Math.max(0, Math.floor(wallets)) : null;
 
   db.run(
-    `INSERT INTO scan_snapshots (user_id, block_height, wallets_detected, scan_time, updated_at)
-     VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+    `INSERT INTO scan_snapshots (user_id, block_height, wallets_detected, scan_time, elapsed_ms, updated_at)
+     VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
      ON CONFLICT(user_id) DO UPDATE SET
        block_height = excluded.block_height,
        wallets_detected = excluded.wallets_detected,
        scan_time = excluded.scan_time,
+       elapsed_ms = excluded.elapsed_ms,
        updated_at = CURRENT_TIMESTAMP`,
-    [userId, String(blockHeight ?? ""), walletsInt, String(scanTime ?? "")],
+    [userId, String(blockHeight or \"\"), walletsInt, String(scanTime or \"\"), (typeof elapsedMs === 'number' ? Math.floor(elapsedMs) : (elapsedMs != null ? Number(elapsedMs) : null))],
     function (err) {
       if (err) return res.status(500).json({ error: 'Database error' });
       res.json({ success: true });
@@ -991,8 +1004,8 @@ app.get('/api/load-scan-data', authenticate, (req, res) => {
   db.get(
     `SELECT block_height AS blockHeight,
             wallets_detected AS walletsDetected,
-            scan_time AS scanTime
-     FROM scan_snapshots WHERE user_id = ?`,
+            scan_time AS scanTime,
+            elapsed_ms AS elapsedMs FROM scan_snapshots WHERE user_id = ?`,
     [userId],
     (err, row) => {
       if (err) return res.status(500).json({ error: 'Database error' });
