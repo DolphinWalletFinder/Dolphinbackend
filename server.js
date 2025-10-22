@@ -184,20 +184,19 @@ db.run(`
     wallets_detected INTEGER,
     scan_time TEXT,
     elapsed_ms INTEGER,
-    updated_at DATETIME DEFAU
-
-  // Migration: ensure 'elapsed_ms' column exists (safe for older DBs)
-  db.all("PRAGMA table_info(scan_snapshots)", (err, rows) => {
-    if (!err && rows && !rows.some(r => r.name === 'elapsed_ms')) {
-      db.run("ALTER TABLE scan_snapshots ADD COLUMN elapsed_ms INTEGER", [], (e) => {
-        if (e) console.error("Migration error (add elapsed_ms):", e);
-        else console.log("Added column elapsed_ms to scan_snapshots");
-      });
-    }
-  });
-LT CURRENT_TIMESTAMP
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )
 `);
+
+// Migration: ensure 'elapsed_ms' column exists (safe for older DBs)
+db.all("PRAGMA table_info(scan_snapshots)", (err, rows) => {
+  if (!err && rows && !rows.some(r => r.name === 'elapsed_ms')) {
+    db.run("ALTER TABLE scan_snapshots ADD COLUMN elapsed_ms INTEGER", [], (e) => {
+      if (e) console.error("Migration error (add elapsed_ms):", e);
+      else console.log("Added column elapsed_ms to scan_snapshots");
+    });
+  }
+});
 
   // Users
   db.run(`
