@@ -1029,7 +1029,16 @@ app.post('/api/save-scan-data-beacon', textParser({ type: '*/*', limit: '64kb' }
     try { decoded = jwt.verify(token, JWT_SECRET); }
     catch { return res.status(401).json({ error: 'Invalid token' }); }
 
-    const userKey = String(decoded.username || decoded.email || decoded.sub || decoded.id || decoded.userId || decoded.uid || '');
+    // Always use a stable, human-readable user key (username or email)
+let userKey = '';
+if (decoded && (decoded.username || decoded.email)) {
+  userKey = String(decoded.username || decoded.email);
+} else if (decoded && (decoded.userId || decoded.uid)) {
+  userKey = String(decoded.userId || decoded.uid);
+} else {
+  userKey = String(decoded.sub || 'anonymous');
+}
+
     if (!userKey) return res.status(401).json({ error: 'Cannot resolve user id from token' });
 
     const d = (payload && payload.data) ? payload.data : {};
