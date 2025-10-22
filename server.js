@@ -991,7 +991,7 @@ app.post('/api/save-scan-data', authenticate, (req, res) => {
        scan_time = excluded.scan_time,
        elapsed_ms = excluded.elapsed_ms,
        updated_at = CURRENT_TIMESTAMP`,
-    [userId, String(blockHeight or \"\"), walletsInt, String(scanTime or \"\"), (typeof elapsedMs === 'number' ? Math.floor(elapsedMs) : (elapsedMs != null ? Number(elapsedMs) : null))],
+    [userId, String(blockHeight || ""), walletsInt, String(scanTime || ""), (typeof elapsedMs === "number" ? Math.floor(elapsedMs) : (elapsedMs != null ? Number(elapsedMs) : null))],
     function (err) {
       if (err) return res.status(500).json({ error: 'Database error' });
       res.json({ success: true });
