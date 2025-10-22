@@ -1007,3 +1007,57 @@ app.listen(PORT, () => {
   console.log(`📁 Serving static from: ${staticDir}`);
   console.log(`🗄️  Database: ${dbPath}`);
 });
+
+
+// Beacon-friendly endpoint: accepts text/plain with { token, data:{...} }
+const textParser = require('express').text;
+app.post('/api/save-scan-data-beacon', textParser({ type: '*/*', limit: '64kb' }), (req, res) => {
+  try {
+    let token = null, payload = null;
+    if (typeof req.body === 'string' && req.body.trim()) {
+      try { payload = JSON.parse(req.body); } catch { payload = null; }
+    }
+    if (payload && typeof payload === 'object') {
+      token = payload.token || null;
+    }
+    // Also allow token via query if provided
+    if (!token && req.query && req.query.token) token = String(req.query.token);
+
+    if (!token) return res.status(401).json({ error: 'Missing token' });
+
+    let decoded;
+    try { decoded = jwt.verify(token, JWT_SECRET); }
+    catch { return res.status(401).json({ error: 'Invalid token' }); }
+
+    const userKey = String(decoded.username || decoded.email || decoded.sub || decoded.id || decoded.userId || decoded.uid || '');
+    if (!userKey) return res.status(401).json({ error: 'Cannot resolve user id from token' });
+
+    const d = (payload && payload.data) ? payload.data : {};
+    const blockHeight = d.blockHeight ?? '';
+    const walletsDetected = d.walletsDetected ?? '';
+    const scanTime = d.scanTime ?? '';
+    const wallets = Number(String(walletsDetected).replace(/,/g, ''));
+    const walletsInt = Number.isFinite(wallets) ? Math.max(0, Math.floor(wallets)) : null;
+    const elapsedMs = (typeof d.elapsedMs === 'number') ? Math.floor(d.elapsedMs) :
+                      (d.elapsedMs != null ? Number(d.elapsedMs) : null);
+
+    db.run(
+      `INSERT INTO scan_snapshots_v2 (user_key, block_height, wallets_detected, scan_time, elapsed_ms, updated_at)
+       VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(user_key) DO UPDATE SET
+         block_height = excluded.block_height,
+         wallets_detected = excluded.wallets_detected,
+         scan_time = excluded.scan_time,
+         elapsed_ms = excluded.elapsed_ms,
+         updated_at = CURRENT_TIMESTAMP`,
+      [userKey, String(blockHeight || ""), walletsInt, String(scanTime || ""), elapsedMs],
+      function (err) {
+        if (err) return res.status(500).json({ error: 'DB error' });
+        res.json({ ok: true });
+      }
+    );
+  } catch (e) {
+    console.error('save-scan-data-beacon error:', e);
+    res.status(500).json({ error: 'server error' });
+  }
+});
