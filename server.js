@@ -1,4 +1,4 @@
-// server_final_with_endat.js
+// server.js
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const bcrypt = require('bcrypt');
@@ -354,12 +354,41 @@ app.post('/api/register', async (req, res) => {
   if (!username || !email || !password)
     return res.status(400).json({ error: 'All fields required' });
 
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', (req, res) => {
   try {
     const { username, email, password } = req.body || {};
     if (!password) return res.status(400).json({ error: 'Password required' });
 
     const field = (username && String(username).trim()) ? 'username'
+                 : (email && String(email).trim()) ? 'email'
+                 : null;
+    const value = field === 'username' ? String(username).trim()
+                 : field === 'email' ? String(email).trim()
+                 : null;
+    if (!field || !value) return res.status(400).json({ error: 'Username or email required' });
+
+    db.get(`SELECT * FROM users WHERE ${field} = ? LIMIT 1`, [value], (err, row) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      if (!row) return res.status(401).json({ error: 'Invalid credentials' });
+
+      // Use bcrypt.compare with callback to avoid top-level await inside callbacks
+      bcrypt.compare(String(password), row.password || '', (cmpErr, ok) => {
+        if (cmpErr) return res.status(500).json({ error: 'Auth error' });
+        if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+
+        const token = jwt.sign(
+          { id: row.id, username: row.username, email: row.email, role: row.role || 'user' },
+          JWT_SECRET,
+          { expiresIn: '7d' }
+        );
+        return res.json({ token, role: row.role || 'user', username: row.username, email: row.email });
+      });
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+const field = (username && String(username).trim()) ? 'username'
                  : (email && String(email).trim()) ? 'email'
                  : null;
     const value = field === 'username' ? String(username).trim()
