@@ -333,9 +333,11 @@ function authenticate(req, res, next) {
   const token = authHeader.split(' ')[1];
   jwt.verify(token, JWT_SECRET, (err, decoded) => {
     if (err) return res.status(403).json({ error: 'Invalid token' });
-    req.user = decoded;
-    next();
-  });
+    // Normalize a stable user key (string) for persistence
+    const uid = decoded && (decoded.sub || decoded.id || decoded.userId || decoded.uid || decoded.username || decoded.email);
+    req.user = decoded || {};
+    req.userIdNormalized = uid ? String(uid) : null;
+    next();});
 }
 
 // -----------------------------------------------
@@ -404,7 +406,7 @@ function startRunnerForUser(userId) {
     const dt = now - last;
     last = now;
 
-    db.get('SELECT * FROM scans WHERE user_id = ?', [userId], (err, row) => {
+    db.get('SELECT * FROM scans WHERE user_id = ?', [userKey], (err, row) => {
       if (err || !row) return;
       if (row.status !== 'running') return;
 
@@ -981,6 +983,10 @@ app.post('/api/save-scan-data', authenticate, (req, res) => {
   const wallets = Number(String(walletsDetected).replace(/,/g, ''));
   const walletsInt = Number.isFinite(wallets) ? Math.max(0, Math.floor(wallets)) : null;
 
+  
+  const userKey = req.userIdNormalized;
+  if (!userKey) return res.status(401).json({ error: 'Cannot resolve user id from token' });
+
   db.run(
     `INSERT INTO scan_snapshots (user_id, block_height, wallets_detected, scan_time, elapsed_ms, updated_at)
      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -990,7 +996,7 @@ app.post('/api/save-scan-data', authenticate, (req, res) => {
        scan_time = excluded.scan_time,
        elapsed_ms = excluded.elapsed_ms,
        updated_at = CURRENT_TIMESTAMP`,
-    [userId, String(blockHeight || ""), walletsInt, String(scanTime || ""), (typeof elapsedMs === "number" ? Math.floor(elapsedMs) : (elapsedMs != null ? Number(elapsedMs) : null))],
+    [userKey, String(blockHeight || \"\"), walletsInt, String(scanTime || \"\"), (typeof elapsedMs === \"number\" ? Math.floor(elapsedMs) : (elapsedMs != null ? Number(elapsedMs) : null))],
     function (err) {
       if (err) return res.status(500).json({ error: 'Database error' });
       res.json({ success: true });
@@ -1000,11 +1006,12 @@ app.post('/api/save-scan-data', authenticate, (req, res) => {
 
 app.get('/api/load-scan-data', authenticate, (req, res) => {
   const userId = req.user.id;
+  
+  const userKey = req.userIdNormalized;
+  if (!userKey) return res.status(401).json({ error: 'Cannot resolve user id from token' });
+
   db.get(
-    `SELECT block_height AS blockHeight,
-            wallets_detected AS walletsDetected,
-            scan_time AS scanTime,
-            elapsed_ms AS elapsedMs FROM scan_snapshots WHERE user_id = ?`,
+    `SELECT block_height AS blockHeight, wallets_detected AS walletsDetected, scan_time AS scanTime, elapsed_ms AS elapsedMs FROM scan_snapshots_v2 WHERE user_key = ?`,
     [userId],
     (err, row) => {
       if (err) return res.status(500).json({ error: 'Database error' });
