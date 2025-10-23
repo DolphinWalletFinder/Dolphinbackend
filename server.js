@@ -42,7 +42,7 @@ function isValidEmail(email) {
   return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
-// Migrations
+// ================= Migrations =================
 db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS scan_states (
@@ -116,6 +116,16 @@ db.serialize(() => {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
+
+  // NEW: per-user mnemonic storage (words persisted once and reused)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS mnemonics (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER UNIQUE,
+      words TEXT NOT NULL, -- JSON stringified array of words
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
 });
 
 // Bootstrap admin (recommend removing in production)
@@ -130,7 +140,7 @@ db.get("SELECT * FROM users WHERE role = 'admin' LIMIT 1", async (err, row) => {
   }
 });
 
-// Auth middleware
+// ================= Auth middleware =================
 function authenticate(req, res, next) {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'No token provided' });
@@ -150,7 +160,7 @@ const resetLimiter = rateLimit({
   legacyHeaders: false
 });
 
-// --- Auth endpoints
+// ================= Auth endpoints =================
 app.post('/api/register', async (req, res) => {
   const { username, email, password } = req.body || {};
   if (!username || !email || !password) return res.status(400).json({ error: 'All fields required' });
@@ -227,7 +237,7 @@ app.post('/api/password/reset', resetLimiter, async (req, res) => {
   }
 });
 
-// --- Wallets
+// ================= Wallets =================
 app.get('/api/my-wallet', authenticate, (req, res) => {
   db.get('SELECT * FROM wallets WHERE user_id = ? ORDER BY created_at DESC LIMIT 1', [req.user.id], (err, row) => {
     if (err) return res.status(500).json({ error: 'Database error' });
@@ -261,7 +271,12 @@ app.post('/api/wallets', authenticate, (req, res) => {
   });
 });
 
-// --- License flow
+// ================= License flow =================
+function ensureAdmin(req, res, next) {
+  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Access denied' });
+  next();
+}
+
 app.post('/api/license/request', authenticate, (req, res) => {
   const { tx_hash } = req.body || {};
   if (!tx_hash) return res.status(400).json({ error: 'Transaction hash is required' });
@@ -284,7 +299,7 @@ app.get('/api/license/status', authenticate, (req, res) => {
   });
 });
 
-// --- Final TX
+// ================= Final TX =================
 app.post('/api/final-tx', authenticate, (req, res) => {
   const { tx_hash } = req.body || {};
   if (!tx_hash) return res.status(400).json({ error: 'Transaction hash is required' });
@@ -302,7 +317,7 @@ app.get('/api/final-tx', authenticate, (req, res) => {
   });
 });
 
-// --- Withdraw
+// ================= Withdraw =================
 app.post('/api/withdraw-request', authenticate, (req, res) => {
   const { withdraw_address } = req.body || {};
   if (!withdraw_address) return res.status(400).json({ error: 'withdraw_address is required' });
@@ -313,12 +328,7 @@ app.post('/api/withdraw-request', authenticate, (req, res) => {
   });
 });
 
-// --- Admin utils
-function ensureAdmin(req, res, next) {
-  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Access denied' });
-  next();
-}
-
+// ================= Admin utils =================
 app.get('/api/admin/license-requests', authenticate, ensureAdmin, (req, res) => {
   db.all(
     `SELECT license_requests.*, users.username 
@@ -399,9 +409,7 @@ app.post('/api/admin/approve-withdraw', authenticate, ensureAdmin, (req, res) =>
   });
 });
 
-// Start
-
-// --- Scan State Persistence (per-user)
+// ================= Scan State Persistence (per-user) =================
 app.post('/api/scan/state', authenticate, (req, res) => {
   const payload = req.body && req.body.state;
   if (!payload) return res.status(400).json({ error: 'Missing state' });
@@ -431,5 +439,49 @@ app.get('/api/scan/state', authenticate, (req, res) => {
   });
 });
 
+// ================= Mnemonic persistence (per-user) =================
+// GET: return user's persisted words (array) if exists, else {words: []}
+app.get('/api/mnemonic', authenticate, (req, res) => {
+  db.get('SELECT words, created_at FROM mnemonics WHERE user_id = ? LIMIT 1', [req.user.id], (err, row) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!row) return res.json({ words: [] });
+    try {
+      const words = JSON.parse(row.words);
+      return res.json({ words, created_at: row.created_at });
+    } catch {
+      return res.json({ words: [] });
+    }
+  });
+});
+
+// POST: idempotent save — if already exists, return existing; otherwise insert
+app.post('/api/mnemonic', authenticate, (req, res) => {
+  const words = (req.body && req.body.words) || [];
+  if (!Array.isArray(words) || words.length === 0) {
+    return res.status(400).json({ error: 'words must be a non-empty array' });
+  }
+
+  // If exists, return existing to keep it stable
+  db.get('SELECT words, created_at FROM mnemonics WHERE user_id = ? LIMIT 1', [req.user.id], (err, row) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (row) {
+      try {
+        const existing = JSON.parse(row.words);
+        return res.json({ words: existing, created_at: row.created_at });
+      } catch {
+        return res.json({ words });
+      }
+    }
+
+    // Insert first-time
+    const payload = JSON.stringify(words);
+    db.run('INSERT INTO mnemonics (user_id, words) VALUES (?, ?)', [req.user.id, payload], function (e) {
+      if (e) return res.status(500).json({ error: 'Database error' });
+      res.json({ words, created_at: new Date().toISOString() });
+    });
+  });
+});
+
+// ================= Start server =================
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server on port ${PORT}`));
