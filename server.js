@@ -45,6 +45,15 @@ function isValidEmail(email) {
 // Migrations
 db.serialize(() => {
   db.run(`
+    CREATE TABLE IF NOT EXISTS scan_states (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER UNIQUE,
+      data TEXT,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  db.run(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       username TEXT UNIQUE,
@@ -391,5 +400,36 @@ app.post('/api/admin/approve-withdraw', authenticate, ensureAdmin, (req, res) =>
 });
 
 // Start
+
+// --- Scan State Persistence (per-user)
+app.post('/api/scan/state', authenticate, (req, res) => {
+  const payload = req.body && req.body.state;
+  if (!payload) return res.status(400).json({ error: 'Missing state' });
+
+  let str;
+  try { str = JSON.stringify(payload); }
+  catch(e){ return res.status(400).json({ error: 'Bad state JSON' }); }
+
+  db.run(
+    `INSERT INTO scan_states (user_id, data, updated_at)
+     VALUES (?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(user_id) DO UPDATE SET data = excluded.data, updated_at = CURRENT_TIMESTAMP`,
+    [req.user.id, str],
+    function (err) {
+      if (err) { console.error('scan state save error', err); return res.status(500).json({ error: 'DB error' }); }
+      res.json({ success: true });
+    }
+  );
+});
+
+app.get('/api/scan/state', authenticate, (req, res) => {
+  db.get('SELECT data, updated_at FROM scan_states WHERE user_id = ? LIMIT 1', [req.user.id], (err, row) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!row) return res.json({ state: null });
+    try { return res.json({ state: JSON.parse(row.data), updated_at: row.updated_at }); }
+    catch(e){ return res.json({ state: null, updated_at: row.updated_at }); }
+  });
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server on port ${PORT}`));
