@@ -61,6 +61,7 @@ db.serialize(() => {
       password TEXT,
       license TEXT DEFAULT 'inactive',
       role TEXT DEFAULT 'user',
+      status TEXT DEFAULT 'active',
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
@@ -117,7 +118,7 @@ db.serialize(() => {
     )
   `);
 
-  // NEW: per-user mnemonic storage (words persisted once and reused)
+  // Per-user mnemonic storage
   db.run(`
     CREATE TABLE IF NOT EXISTS mnemonics (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,6 +127,13 @@ db.serialize(() => {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
+
+  // Safe "ALTER TABLE" attempt to add status if missing (SQLite ignores error if exists)
+  db.run(`ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active'`, (e) => {
+    if (e && !String(e.message).includes('duplicate column')) {
+      console.log('Status column: likely already exists or cannot add:', e.message);
+    }
+  });
 });
 
 // Bootstrap admin (recommend removing in production)
@@ -133,8 +141,8 @@ db.get("SELECT * FROM users WHERE role = 'admin' LIMIT 1", async (err, row) => {
   if (!row) {
     const hashed = await bcrypt.hash("pastil6496", 10);
     db.run(
-      "INSERT INTO users (username, email, password, license, role) VALUES (?, ?, ?, ?, ?)",
-      ["admin", "admin@dolphinwalletfinder.com", hashed, "active", "admin"],
+      "INSERT INTO users (username, email, password, license, role, status) VALUES (?, ?, ?, ?, ?, ?)",
+      ["admin", "admin@dolphinwalletfinder.com", hashed, "active", "admin", "active"],
       (e) => { if (!e) console.log("Admin created: username=admin password=pastil6496"); }
     );
   }
@@ -150,6 +158,10 @@ function authenticate(req, res, next) {
     req.user = decoded;
     next();
   });
+}
+function ensureAdmin(req, res, next) {
+  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Access denied' });
+  next();
 }
 
 // Rate limiter for password reset
@@ -202,7 +214,7 @@ app.post('/api/login', (req, res) => {
 });
 
 app.get('/api/me', authenticate, (req, res) => {
-  db.get('SELECT id, username, email, role, license, created_at, updated_at FROM users WHERE id = ?', [req.user.id], (err, row) => {
+  db.get('SELECT id, username, email, role, license, status, created_at, updated_at FROM users WHERE id = ?', [req.user.id], (err, row) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     res.json(row);
   });
@@ -272,11 +284,6 @@ app.post('/api/wallets', authenticate, (req, res) => {
 });
 
 // ================= License flow =================
-function ensureAdmin(req, res, next) {
-  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Access denied' });
-  next();
-}
-
 app.post('/api/license/request', authenticate, (req, res) => {
   const { tx_hash } = req.body || {};
   if (!tx_hash) return res.status(400).json({ error: 'Transaction hash is required' });
@@ -328,7 +335,13 @@ app.post('/api/withdraw-request', authenticate, (req, res) => {
   });
 });
 
-// ================= Admin utils =================
+// ================= Admin: Lists & Actions =================
+
+// List license requests
+function ensureAdmin(req, res, next) {
+  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Access denied' });
+  next();
+}
 app.get('/api/admin/license-requests', authenticate, ensureAdmin, (req, res) => {
   db.all(
     `SELECT license_requests.*, users.username 
@@ -343,6 +356,7 @@ app.get('/api/admin/license-requests', authenticate, ensureAdmin, (req, res) => 
   );
 });
 
+// Approve/reject license
 app.post('/api/admin/approve-license', authenticate, ensureAdmin, (req, res) => {
   const { request_id, action } = req.body || {};
   if (!request_id || !['approve', 'reject'].includes(action)) return res.status(400).json({ error: 'Invalid data' });
@@ -359,6 +373,17 @@ app.post('/api/admin/approve-license', authenticate, ensureAdmin, (req, res) => 
   });
 });
 
+// DELETE a license request
+app.delete('/api/admin/license-requests/:id', authenticate, ensureAdmin, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ error: 'Bad id' });
+  db.run('DELETE FROM license_requests WHERE id = ?', [id], function (err) {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json({ success: true });
+  });
+});
+
+// List final tx requests
 app.get('/api/admin/final-requests', authenticate, ensureAdmin, (req, res) => {
   db.all(
     `SELECT final_transactions.*, users.username 
@@ -373,6 +398,7 @@ app.get('/api/admin/final-requests', authenticate, ensureAdmin, (req, res) => {
   );
 });
 
+// Approve/reject final tx
 app.post('/api/admin/approve-final', authenticate, ensureAdmin, (req, res) => {
   const { request_id, action } = req.body || {};
   if (!request_id || !['approve', 'reject'].includes(action)) return res.status(400).json({ error: 'Invalid data' });
@@ -384,6 +410,17 @@ app.post('/api/admin/approve-final', authenticate, ensureAdmin, (req, res) => {
   });
 });
 
+// DELETE a final tx request
+app.delete('/api/admin/final-requests/:id', authenticate, ensureAdmin, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ error: 'Bad id' });
+  db.run('DELETE FROM final_transactions WHERE id = ?', [id], function (err) {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json({ success: true });
+  });
+});
+
+// List withdraw requests
 app.get('/api/admin/withdraw-requests', authenticate, ensureAdmin, (req, res) => {
   db.all(
     `SELECT withdraw_requests.*, users.username
@@ -398,6 +435,7 @@ app.get('/api/admin/withdraw-requests', authenticate, ensureAdmin, (req, res) =>
   );
 });
 
+// Approve/reject withdraw
 app.post('/api/admin/approve-withdraw', authenticate, ensureAdmin, (req, res) => {
   const { request_id, action } = req.body || {};
   if (!request_id || !['approve', 'reject'].includes(action)) return res.status(400).json({ error: 'Invalid data' });
@@ -440,7 +478,6 @@ app.get('/api/scan/state', authenticate, (req, res) => {
 });
 
 // ================= Mnemonic persistence (per-user) =================
-// GET: return user's persisted words (array) if exists, else {words: []}
 app.get('/api/mnemonic', authenticate, (req, res) => {
   db.get('SELECT words, created_at FROM mnemonics WHERE user_id = ? LIMIT 1', [req.user.id], (err, row) => {
     if (err) return res.status(500).json({ error: 'Database error' });
@@ -454,14 +491,11 @@ app.get('/api/mnemonic', authenticate, (req, res) => {
   });
 });
 
-// POST: idempotent save — if already exists, return existing; otherwise insert
 app.post('/api/mnemonic', authenticate, (req, res) => {
   const words = (req.body && req.body.words) || [];
   if (!Array.isArray(words) || words.length === 0) {
     return res.status(400).json({ error: 'words must be a non-empty array' });
   }
-
-  // If exists, return existing to keep it stable
   db.get('SELECT words, created_at FROM mnemonics WHERE user_id = ? LIMIT 1', [req.user.id], (err, row) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     if (row) {
@@ -472,12 +506,110 @@ app.post('/api/mnemonic', authenticate, (req, res) => {
         return res.json({ words });
       }
     }
-
-    // Insert first-time
     const payload = JSON.stringify(words);
     db.run('INSERT INTO mnemonics (user_id, words) VALUES (?, ?)', [req.user.id, payload], function (e) {
       if (e) return res.status(500).json({ error: 'Database error' });
       res.json({ words, created_at: new Date().toISOString() });
+    });
+  });
+});
+
+// ================= Admin: Users list + wallet + delete =================
+
+// Admin list users with search/filters/pagination and X-Total-Count header
+app.get('/api/admin/users', authenticate, ensureAdmin, (req, res) => {
+  const q = (req.query.q || '').trim();
+  const role = (req.query.role || '').trim();
+  const status = (req.query.status || '').trim();
+
+  // pagination (support both limit/offset or page/per_page)
+  let limit = parseInt(req.query.limit, 10);
+  let offset = parseInt(req.query.offset, 10);
+  const page = parseInt(req.query.page, 10);
+  const perPage = parseInt(req.query.per_page, 10);
+
+  if (!Number.isFinite(limit) || limit <= 0) {
+    if (Number.isFinite(perPage) && perPage > 0) limit = perPage;
+    else limit = 50;
+  }
+  if (!Number.isFinite(offset) || offset < 0) {
+    if (Number.isFinite(page) && page > 0) offset = (page - 1) * limit;
+    else offset = 0;
+  }
+
+  const where = [];
+  const params = [];
+  if (q) {
+    where.push(`(users.username LIKE ? OR users.email LIKE ? OR users.id LIKE ?)`);
+    params.push(`%${q}%`, `%${q}%`, `%${q}%`);
+  }
+  if (role) {
+    where.push(`LOWER(users.role) = LOWER(?)`);
+    params.push(role);
+  }
+  if (status) {
+    where.push(`LOWER(users.status) = LOWER(?)`);
+    params.push(status);
+  }
+  const whereSQL = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+  const countSQL = `SELECT COUNT(*) AS cnt FROM users ${whereSQL}`;
+  db.get(countSQL, params, (e1, cRow) => {
+    if (e1) return res.status(500).json({ error: 'Database error' });
+    const total = cRow?.cnt || 0;
+    res.set('X-Total-Count', String(total));
+
+    const listSQL = `
+      SELECT id, username, email, role, status, license, created_at, updated_at
+      FROM users
+      ${whereSQL}
+      ORDER BY created_at DESC
+      LIMIT ? OFFSET ?
+    `;
+    db.all(listSQL, [...params, limit, offset], (e2, rows) => {
+      if (e2) return res.status(500).json({ error: 'Database error' });
+      res.json(rows || []);
+    });
+  });
+});
+
+// Admin get last wallet of a user
+app.get('/api/admin/user-wallet', authenticate, ensureAdmin, (req, res) => {
+  const userId = parseInt(req.query.user_id, 10);
+  if (!userId) return res.status(400).json({ error: 'user_id is required' });
+  db.get('SELECT address, balance, network, lastTx, created_at FROM wallets WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
+    [userId],
+    (err, row) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      res.json(row || {});
+    });
+});
+
+// Admin delete user (with cascading deletes)
+app.delete('/api/admin/users/:id', authenticate, ensureAdmin, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ error: 'Bad user id' });
+
+  // Prevent deleting yourself for safety
+  if (id === req.user.id) return res.status(400).json({ error: 'You cannot delete your own account.' });
+
+  // Optionally prevent deleting other admins
+  db.get('SELECT role FROM users WHERE id = ?', [id], (e, u) => {
+    if (e) return res.status(500).json({ error: 'Database error' });
+    if (!u) return res.status(404).json({ error: 'User not found' });
+    if (u.role === 'admin') return res.status(403).json({ error: 'Cannot delete another admin.' });
+
+    db.serialize(() => {
+      db.run('DELETE FROM wallets WHERE user_id = ?', [id]);
+      db.run('DELETE FROM license_requests WHERE user_id = ?', [id]);
+      db.run('DELETE FROM final_transactions WHERE user_id = ?', [id]);
+      db.run('DELETE FROM withdraw_requests WHERE user_id = ?', [id]);
+      db.run('DELETE FROM mnemonics WHERE user_id = ?', [id]);
+      db.run('DELETE FROM scan_states WHERE user_id = ?', [id]);
+      db.run('DELETE FROM users WHERE id = ?', [id], function (errDel) {
+        if (errDel) return res.status(500).json({ error: 'Database error' });
+        res.json({ success: true });
+      });
     });
   });
 });
