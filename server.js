@@ -614,6 +614,41 @@ app.delete('/api/admin/users/:id', authenticate, ensureAdmin, (req, res) => {
   });
 });
 
+// ====== Scan state persistence APIs ======
+app.get('/api/scan-state', authenticate, (req, res) => {
+  db.get('SELECT data, updated_at FROM scan_states WHERE user_id = ?', [req.user.id], (err, row) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    let data = null;
+    if (row && row.data) {
+      try { data = JSON.parse(row.data); } catch { data = null; }
+    }
+    res.json({ data, updated_at: row ? row.updated_at : null });
+  });
+});
+
+app.post('/api/scan-state', authenticate, (req, res) => {
+  const payload = req.body && req.body.data;
+  if (!payload || typeof payload !== 'object') return res.status(400).json({ error: 'Invalid scan state' });
+  const dataStr = JSON.stringify(payload);
+  db.run(
+    `INSERT INTO scan_states (user_id, data)
+     VALUES (?, ?)
+     ON CONFLICT(user_id) DO UPDATE SET data = excluded.data, updated_at = CURRENT_TIMESTAMP`,
+    [req.user.id, dataStr],
+    function (err) {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      res.json({ ok: true });
+    }
+  );
+});
+
+app.delete('/api/scan-state', authenticate, (req, res) => {
+  db.run('DELETE FROM scan_states WHERE user_id = ?', [req.user.id], function (err) {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json({ ok: true });
+  });
+});
+
 // ================= Start server =================
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server on port ${PORT}`));
